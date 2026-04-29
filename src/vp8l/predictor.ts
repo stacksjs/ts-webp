@@ -256,7 +256,7 @@ export function applyPredictorTransform(
       if (x === 0) {
         predictor = prevRow[0]
       } else {
-        const L = currRow[x - 1] // already-original this row, but mutated past x-1!
+        const L = currRow[x - 1]
         const T = prevRow[x]
         const TL = prevRow[x - 1]
         const TR = x + 1 < width ? prevRow[x + 1] : prevRow[x]
