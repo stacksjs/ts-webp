@@ -87,25 +87,28 @@ function averageARGB(a: number, b: number): number {
 }
 
 /**
- * Mode 11 — "Paeth-like" predictor: picks whichever of L, T, TL is
- * closest to the gradient `L + T - TL`.
+ * Mode 11 — "Select" predictor. Mirrors libwebp's
+ *   uint32_t Select(uint32_t a, uint32_t b, uint32_t c)  // a=T, b=L, c=TL
+ *     pa_minus_pb = sum_chan( |L_k - TL_k| - |T_k - TL_k| )
+ *     return (pa_minus_pb <= 0) ? T : L
+ *
+ * The summation is *across all four channels* (a per-channel select would
+ * be a different and incorrect predictor). The condition picks T when L
+ * is at least as close to TL as T is — i.e. when the row above looks
+ * static, follow the column; otherwise, when the column above looks
+ * static, follow the row.
+ *
+ * Required for ALPH lossless interop with libwebp/cwebp.
  */
 function selectPredictor(L: number, T: number, TL: number): number {
-  let result = 0
+  let paMinusPb = 0
   for (let shift = 0; shift < 32; shift += 8) {
     const l = (L >>> shift) & 0xFF
     const t = (T >>> shift) & 0xFF
     const tl = (TL >>> shift) & 0xFF
-    const pa = Math.abs(t - tl)
-    const pb = Math.abs(l - tl)
-    const pc = Math.abs(l + t - 2 * tl)
-    let chosen: number
-    if (pa <= pb && pa <= pc) chosen = l
-    else if (pb <= pc) chosen = t
-    else chosen = tl
-    result |= chosen << shift
+    paMinusPb += Math.abs(l - tl) - Math.abs(t - tl)
   }
-  return result >>> 0
+  return paMinusPb <= 0 ? T : L
 }
 
 /** Saturate a value into [0, 255]. */
@@ -138,11 +141,14 @@ function clampAddSubtractHalf(a: number, b: number): number {
   for (let shift = 0; shift < 32; shift += 8) {
     const av = (a >>> shift) & 0xFF
     const bv = (b >>> shift) & 0xFF
-    // (av + (av - bv) / 2) → av + (av - bv) >> 1 with C-style rounding.
-    // VP8L uses arithmetic shift; the residual is rounded toward -∞ so
-    // we replicate `(av - bv) >> 1` using a sign-extension trick.
+    // libwebp uses C integer division `/ 2`, which rounds *toward zero*.
+    // JS's arithmetic shift `>> 1` rounds toward `-Infinity` instead, so
+    // `(-1) >> 1 === -1` while C's `(-1) / 2 === 0`. We can't blindly
+    // shift here — the rounding direction matters for negative residuals
+    // and a one-off mismatch here corrupts every subsequent backreference
+    // copy. Use `Math.trunc` to match C's truncation semantics.
     const diff = av - bv
-    const half = diff >> 1 // arithmetic shift; preserves sign
+    const half = Math.trunc(diff / 2)
     result |= clamp255(av + half) << shift
   }
   return result >>> 0
@@ -179,8 +185,11 @@ export function inversePredictorTransform(
         predictor = argb[i - width]
       } else {
         const blockIdx = (y >>> bits) * modeWidth + (x >>> bits)
-        // Mode is stored in the green channel of the mode-image pixel.
-        const mode = (modeImage[blockIdx] >>> 8) & 0xFF
+        // Mode is stored in the green channel of the mode-image pixel,
+        // masked to 4 bits — libwebp's `dsp/lossless.c` does
+        // `(green >> 8) & 0x0F`. cwebp packs the mode in the low nibble
+        // of the green byte; the high nibble is reserved/uninitialised.
+        const mode = (modeImage[blockIdx] >>> 8) & 0x0F
         const L = argb[i - 1]
         const T = argb[i - width]
         const TL = argb[i - width - 1]

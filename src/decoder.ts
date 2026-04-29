@@ -1,4 +1,5 @@
 import type { WebpDecodeOptions, WebpImageData } from './types'
+import { decodeAlpha } from './alpha'
 import { parseRiff } from './riff'
 import { decodeVP8 } from './vp8/decoder'
 import { decodeVP8L } from './vp8l/decoder'
@@ -6,10 +7,14 @@ import { decodeVP8L } from './vp8l/decoder'
 /**
  * Decode a WebP image buffer to RGBA pixel data.
  *
- * Currently supports the lossless (VP8L) format and the extended
- * (VP8X + VP8L) container that wraps it. Lossy (VP8) chunks throw a
- * clear `lossy not implemented` error rather than producing fake
- * output — see `vp8/decoder.ts` for context.
+ * Supported containers:
+ *   - simple `RIFF/WEBP/VP8 ` (lossy VP8) — bit-exact with `dwebp`
+ *   - simple `RIFF/WEBP/VP8L` (lossless) — round-trips exactly
+ *   - extended `RIFF/WEBP/VP8X + VP8L` (lossless with optional alpha)
+ *   - extended `RIFF/WEBP/VP8X + ALPH + VP8 ` (lossy with alpha)
+ *
+ * VP8L is preferred over VP8 when both are present in the same
+ * container (rare, but valid in some extended-format files).
  */
 export function decode(
   buffer: Uint8Array | ArrayBuffer,
@@ -18,10 +23,6 @@ export function decode(
   const data = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer
   const chunks = parseRiff(data)
 
-  // Find the actual pixel-data chunk. VP8L is preferred over VP8 when
-  // both are present (rare, but valid in extended format). We don't
-  // need the VP8X header for anything other than container detection;
-  // the VP8L bitstream carries its own width/height/alpha flag.
   const vp8lChunk = chunks.find(c => c.fourCC === 'VP8L')
   if (vp8lChunk) {
     const imageData = decodeVP8L(vp8lChunk.data)
@@ -31,11 +32,22 @@ export function decode(
 
   const vp8Chunk = chunks.find(c => c.fourCC === 'VP8 ')
   if (vp8Chunk) {
-    // `decodeVP8` throws — see vp8/decoder.ts. We skip the RIFF
-    // info-parser's VP8 frame-header validation here and let the
-    // decoder produce its own clear "lossy not implemented" message,
-    // matching what tests assert.
-    return decodeVP8(vp8Chunk.data)
+    const imageData = decodeVP8(vp8Chunk.data)
+    // If a VP8X + ALPH + VP8 container carries an alpha plane, splice
+    // it in over the all-0xFF alpha decodeVP8 emits. The ALPH chunk
+    // appears BEFORE the VP8 chunk in canonical layout; we accept any
+    // order so we tolerate non-canonical encoders.
+    const alphChunk = chunks.find(c => c.fourCC === 'ALPH')
+    if (alphChunk) {
+      const alpha = decodeAlpha(alphChunk.data, imageData.width, imageData.height)
+      const px = imageData.width * imageData.height
+      for (let i = 0; i < px; i++) {
+        imageData.data[i * 4 + 3] = alpha[i]
+      }
+      imageData.hasAlpha = true
+    }
+    if (options.format === 'rgb') imageData.data = rgbaToRgb(imageData.data)
+    return imageData
   }
 
   throw new Error('ts-webp: no VP8 or VP8L chunk found in WebP container')

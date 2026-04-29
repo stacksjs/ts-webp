@@ -1,6 +1,6 @@
 import type { VP8LHeader, WebpImageData } from '../types'
 import { BitReader } from '../bitreader'
-import { DISTANCE_EXTRA_BITS, distanceFromCode, NUM_DISTANCE_CODES } from './distance'
+import { DISTANCE_EXTRA_BITS, distanceFromCode, NUM_DISTANCE_CODES, planeCodeToDistance } from './distance'
 import { HuffmanTree, readHuffmanTree } from './huffman'
 import { LENGTH_EXTRA_BITS, lengthFromCode, NUM_LENGTH_CODES } from './length'
 import { inverseColorTransform } from './color'
@@ -90,6 +90,21 @@ export function decodeVP8L(data: Uint8Array): WebpImageData {
     height: header.height,
     hasAlpha: header.hasAlpha,
   }
+}
+
+/**
+ * Decode a "naked" VP8L image stream — the bytes after the 5-byte
+ * VP8L header (signature + dimensions + alpha + version), with the
+ * width/height supplied by the caller. Used by ALPH-chunk decoding,
+ * where the surrounding `VP8X + ALPH + VP8 ` container holds the
+ * dimensions and the ALPH bitstream is just the image-data portion of
+ * a VP8L stream. Returns a raw ARGB pixel buffer (Uint32Array, length
+ * = width × height) — callers that need RGBA can split it themselves;
+ * the alpha-decode path only needs the green channel.
+ */
+export function decodeVP8LImageStream(data: Uint8Array, width: number, height: number): Uint32Array {
+  const reader = new BitReader(data)
+  return decodeImage(reader, { width, height, hasAlpha: false, version: 0 })
 }
 
 function readHeader(reader: BitReader): VP8LHeader {
@@ -223,7 +238,8 @@ function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
       g.blue,
       g.alpha,
       g.distance,
-      effectiveWidth * header.height,
+      effectiveWidth,
+      header.height,
       colorCacheBits,
       colorCache,
     )
@@ -266,14 +282,13 @@ function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
  * 5 Huffman trees, and the prefix-coded pixel stream.
  */
 function readSubImage(reader: BitReader, width: number, height: number): Uint32Array {
-  // Sub-image must have transform-present=0. Reading any 1 here would
-  // mean the encoder nested transforms inside a sub-image, which is
-  // legal per spec but our encoder never produces it — and supporting
-  // it on decode wouldn't help any real workload.
-  if (reader.readBit() === 1) {
-    throw new Error('VP8L: nested transforms inside sub-image not supported')
-  }
-
+  // Sub-image header — mirrors libwebp's `DecodeImageStream(...,
+  // is_level0=0, ...)`. Sub-images skip the top-level header fields:
+  //   • NO transform-present flag (transforms are only legal at the top level)
+  //   • NO meta-Huffman bit (meta-Huffman is gated by `allow_recursion`,
+  //     which is set only at level 0)
+  // They go straight to the optional color-cache header, then 1 set of
+  // Huffman trees, then pixel data.
   let colorCacheBits = 0
   if (reader.readBit() === 1) {
     colorCacheBits = reader.readBits(4)
@@ -283,10 +298,6 @@ function readSubImage(reader: BitReader, width: number, height: number): Uint32A
   }
   const colorCacheSize = colorCacheBits > 0 ? 1 << colorCacheBits : 0
   const colorCache = colorCacheSize > 0 ? new Uint32Array(colorCacheSize) : null
-
-  if (reader.readBit() === 1) {
-    throw new Error('VP8L: meta-Huffman in sub-image not supported')
-  }
 
   const numLiteralCodes = NUM_LITERAL_CODES + NUM_LENGTH_CODES + colorCacheSize
   const greenTree = readHuffmanTree(reader, numLiteralCodes)
@@ -302,7 +313,8 @@ function readSubImage(reader: BitReader, width: number, height: number): Uint32A
     blueTree,
     alphaTree,
     distTree,
-    width * height,
+    width,
+    height,
     colorCacheBits,
     colorCache,
   )
@@ -320,11 +332,13 @@ function decodePixelStream(
   blueTree: HuffmanTree,
   alphaTree: HuffmanTree,
   distTree: HuffmanTree,
-  numPixels: number,
+  width: number,
+  height: number,
   colorCacheBits: number,
   colorCache: Uint32Array | null,
 ): Uint32Array {
   const colorCacheSize = colorCache ? colorCache.length : 0
+  const numPixels = width * height
   const argb = new Uint32Array(numPixels)
   let pos = 0
 
@@ -346,7 +360,8 @@ function decodePixelStream(
       const lengthCode = code - NUM_LITERAL_CODES
       const length = lengthFromCode(lengthCode, reader.readBits(LENGTH_EXTRA_BITS[lengthCode]))
       const distanceCode = distTree.readSymbol(reader)
-      const distance = distanceFromCode(distanceCode, reader.readBits(DISTANCE_EXTRA_BITS[distanceCode]))
+      const rawDistance = distanceFromCode(distanceCode, reader.readBits(DISTANCE_EXTRA_BITS[distanceCode]))
+      const distance = planeCodeToDistance(width, rawDistance)
       const start = pos - distance
       if (start < 0) throw new Error(`VP8L: backreference distance ${distance} > position ${pos}`)
       const end = Math.min(pos + length, numPixels)
@@ -429,7 +444,8 @@ function decodePixelStreamMeta(
       const lengthCode = code - NUM_LITERAL_CODES
       const length = lengthFromCode(lengthCode, reader.readBits(LENGTH_EXTRA_BITS[lengthCode]))
       const distanceCode = group.distance.readSymbol(reader)
-      const distance = distanceFromCode(distanceCode, reader.readBits(DISTANCE_EXTRA_BITS[distanceCode]))
+      const rawDistance = distanceFromCode(distanceCode, reader.readBits(DISTANCE_EXTRA_BITS[distanceCode]))
+      const distance = planeCodeToDistance(width, rawDistance)
       const start = pos - distance
       if (start < 0) throw new Error(`VP8L: backreference distance ${distance} > position ${pos}`)
       const end = Math.min(pos + length, numPixels)

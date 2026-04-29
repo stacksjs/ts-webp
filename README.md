@@ -26,11 +26,17 @@ const { data, width, height, hasAlpha } = decode(encoded)
 
 ### Container / animation
 - ✅ **RIFF / WEBP** — parse + emit, zero-copy chunk extraction
-- ✅ **Animated WebP** (ANIM / ANMF) — full container support; each
-  frame decoded via the lossless path. Lossy frames fall through to the
-  VP8 decoder (currently unsupported, see below).
+- ✅ **Animated WebP** (ANIM / ANMF) — full container support; per-frame
+  payload routed to the VP8L (lossless), VP8 (lossy), or VP8 + ALPH
+  (lossy + alpha plane) decoder based on the inner chunks present
 - ✅ **Extended format** (VP8X) — produced by `encodeWithAlpha`,
-  consumed transparently by `decode`.
+  consumed transparently by `decode`
+- ✅ **Lossy + alpha** (VP8X + ALPH + VP8) — full ALPH chunk support
+  including filter inversion (none / horizontal / vertical / gradient)
+  and lossless alpha plane (method=0 raw bytes, method=1 VP8L green
+  channel). `alpha-uncompressed` fixtures match dwebp bit-exactly;
+  `alpha-q80` matches RGB bit-exactly with bounded alpha drift on the
+  cwebp predictor + cache path (see test/alpha.test.ts for details)
 
 ### Lossy (VP8)
 - ✅ **Boolean arithmetic decoder** — full 32-bit-register implementation
@@ -61,9 +67,13 @@ const { data, width, height, hasAlpha } = decode(encoded)
     - 32×16 solid colour at q=75
     - 256×192 multi-segment gradient at q=30, q=50, q=75, q=90
     - 384×288 multi-partition photo-like at q=30, q=75, q=95
-- ❌ **Encode** — not implemented. VP8 lossy encoding additionally
-  needs forward DCT, quantisation, intra-mode selection, rate control,
-  and the boolean encoder. Out of scope; use `cwebp` for lossy WebP files.
+- ❌ **Encode** — not implemented. VP8 lossy encoding requires forward
+  DCT/WHT, a boolean arithmetic encoder, intra-mode selection over the
+  full 4×4 + 16×16 mode set, residual token coding, segment/quantiser
+  rate control, and bit-exact tables (probabilities, dequant LUTs,
+  zigzag scan, coefficient bands, Q-index → DC/AC quantiser maps).
+  This is a multi-thousand-line undertaking; out of scope for this
+  package. Use `cwebp` to produce lossy WebP files.
 
 ## Install
 
@@ -153,16 +163,32 @@ round-trip correctness.
 ```
 src/
 ├── index.ts              — public API
-├── decoder.ts            — RIFF dispatch → VP8L / VP8 decoders
+├── decoder.ts            — RIFF dispatch → VP8L / VP8 / VP8 + ALPH
 ├── encoder.ts            — entry point; chooses lossless or lossy
 ├── riff.ts               — RIFF container parse/build + WebP info parsing
 ├── bitreader.ts          — BitReader / BitWriter (32-bit accumulator)
+├── animation.ts          — ANIM/ANMF container parser; per-frame routing
+├── alpha.ts              — ALPH chunk decoder (raw / VP8L green) + filter inverse
 ├── vp8/
-│   └── decoder.ts        — VP8 (lossy) — currently throws
+│   ├── decoder.ts        — VP8 (lossy) decoder, bit-exact with libwebp
+│   ├── bool-decoder.ts   — arithmetic boolean decoder
+│   ├── header.ts         — frame header parser
+│   ├── intra.ts          — intra prediction modes (4×4 + 16×16 + UV)
+│   ├── coeff.ts          — DCT coefficient tree decoder
+│   ├── idct.ts           — 4×4 IDCT + Y2 WHT inverse
+│   ├── loop-filter.ts    — simple + normal in-loop filters
+│   ├── tables.ts         — quantiser / probability / dequant tables
+│   └── mode.ts           — mode-info decoder
 └── vp8l/
     ├── encoder.ts        — VP8L (lossless) encoder
-    ├── decoder.ts        — VP8L (lossless) decoder
-    └── huffman.ts        — canonical Huffman codec (encode + decode)
+    ├── decoder.ts        — VP8L (lossless) decoder; also exports
+    │                       `decodeVP8LImageStream` for ALPH lossless
+    ├── huffman.ts        — canonical Huffman codec (encode + decode)
+    ├── distance.ts       — LZ77 distance + plane-code remap
+    ├── length.ts         — LZ77 length codes
+    ├── predictor.ts      — predictor transform (forward + inverse)
+    ├── color.ts          — color transform (forward + inverse)
+    └── color-index.ts    — color-indexing transform (forward + inverse)
 ```
 
 ## License

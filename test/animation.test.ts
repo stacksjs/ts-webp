@@ -185,4 +185,24 @@ describe('decodeAnimation', () => {
     expect(() => decodeAnimation(new Uint8Array(0))).toThrow()
     expect(() => decodeAnimation(new Uint8Array([1, 2, 3]))).toThrow()
   })
+
+  it('decodes an animated WebP with VP8 (lossy) frames', async () => {
+    // Fixture built via `img2webp -lossy -q 80 -d 100 f1.pam -d 200 f2.pam`
+    // (cwebp emits VP8 chunks per frame; the inner ALPH chunk is absent
+    // because the input frames are opaque). Exercises the VP8-frame path
+    // in `decodeFramePayload`, which previously only handled VP8L.
+    const path = `${import.meta.dir}/fixtures/anim-lossy.webp`
+    const buf = new Uint8Array(await Bun.file(path).arrayBuffer())
+    const anim = decodeAnimation(buf)
+    expect(anim.width).toBe(32)
+    expect(anim.height).toBe(32)
+    expect(anim.frames).toHaveLength(2)
+    expect(anim.frames[0].duration).toBe(100)
+    expect(anim.frames[1].duration).toBe(200)
+    for (const f of anim.frames) {
+      expect(f.image.width).toBe(32)
+      expect(f.image.height).toBe(32)
+      expect(f.image.data.length).toBe(32 * 32 * 4)
+    }
+  })
 })

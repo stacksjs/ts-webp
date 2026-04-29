@@ -1,6 +1,6 @@
 import type { WebpEncodeOptions, WebpImageData } from '../types'
 import { BitWriter } from '../bitreader'
-import { distanceToCode, NUM_DISTANCE_CODES } from './distance'
+import { distanceToCode, linearDistanceToRaw, NUM_DISTANCE_CODES } from './distance'
 import { buildCodeLengths, lengthsToCodes, reverseBits, writeHuffmanTree } from './huffman'
 import { lengthToCode, MAX_LENGTH, NUM_LENGTH_CODES } from './length'
 import { applyColorTransform } from './color'
@@ -192,7 +192,7 @@ export function encodeVP8L(
   const tokenKind = new Uint8Array(workNumPixels)
   const tokenA = new Uint32Array(workNumPixels)
   const tokenB = new Uint32Array(workNumPixels)
-  const numTokens = tokenize(workArgb, opts, tokenKind, tokenA, tokenB)
+  const numTokens = tokenize(workArgb, workWidth, opts, tokenKind, tokenA, tokenB)
 
   // ── Step 4: histograms + trees ──
   const cacheSize = opts.useColorCache ? 1 << opts.cacheBits : 0
@@ -309,6 +309,16 @@ export function encodeVP8L(
   writeHuffmanTree(writer, alphaLen)
   writeHuffmanTree(writer, distLen)
 
+  // After the simple-code header is on the wire, zero-out lengths for
+  // single-symbol trees so per-pixel `emitSymbol` calls contribute no
+  // bits. The decoder side (`HuffmanTree` for a 1-leaf tree) consumes
+  // 0 bits per read, so encoder and decoder stay in sync.
+  zeroIfSingleSymbol(greenLen)
+  zeroIfSingleSymbol(redLen)
+  zeroIfSingleSymbol(blueLen)
+  zeroIfSingleSymbol(alphaLen)
+  zeroIfSingleSymbol(distLen)
+
   // Pre-compute canonical codes for fast lookup during emission.
   const greenCodes = lengthsToCodes(greenLen)
   const redCodes = lengthsToCodes(redLen)
@@ -387,6 +397,7 @@ function applySubtractGreen(argb: Uint32Array): void {
  */
 function tokenize(
   argb: Uint32Array,
+  width: number,
   opts: InternalOptions,
   tokenKind: Uint8Array,
   tokenA: Uint32Array,
@@ -426,7 +437,10 @@ function tokenize(
         ) len++
         if (len >= 3) {
           const distance = i - matchPos
-          const distEnc = distanceToCode(distance)
+          // Convert the linear distance into the cheapest raw value (plane
+          // code or `distance + 120`) before prefix-encoding it.
+          const rawDistance = linearDistanceToRaw(distance, width)
+          const distEnc = rawDistance !== null ? distanceToCode(rawDistance) : null
           const lenEnc = lengthToCode(len)
           if (distEnc !== null && lenEnc !== null) {
             tokenKind[nTokens] = TokenKind.Backref
@@ -504,9 +518,12 @@ function hashOf(argb: Uint32Array, i: number, hashMask: number): number {
 // ---------------------------------------------------------------------------
 
 function emitSymbol(writer: BitWriter, len: number, code: number): void {
-  if (len === 0) {
-    throw new Error('emitSymbol: zero-length code for an emitted symbol')
-  }
+  // `len === 0` is the "single-symbol tree" signal: the simple-code header
+  // already pinned which symbol every read returns, so per-pixel emits
+  // contribute zero bits to the stream. Mirrors libwebp's decode-side
+  // behaviour (`HuffmanCode.bits = 0` after `BuildHuffmanTable` for a
+  // 1-leaf tree).
+  if (len === 0) return
   writer.writeBits(reverseBits(code, len), len)
 }
 
@@ -514,6 +531,25 @@ function sum(arr: Uint32Array): number {
   let s = 0
   for (let i = 0; i < arr.length; i++) s += arr[i]
   return s
+}
+
+/**
+ * If `lengths` contains exactly one non-zero entry (a single-symbol tree),
+ * zero it. The simple-code wire header already pins the symbol; per-pixel
+ * `emitSymbol` calls should contribute zero bits, matching libwebp's
+ * decode-side behaviour.
+ */
+function zeroIfSingleSymbol(lengths: Uint8Array): void {
+  let nonZero = 0
+  let firstIdx = -1
+  for (let i = 0; i < lengths.length; i++) {
+    if (lengths[i] > 0) {
+      nonZero++
+      if (firstIdx < 0) firstIdx = i
+      if (nonZero > 1) return
+    }
+  }
+  if (nonZero === 1) lengths[firstIdx] = 0
 }
 
 // ---------------------------------------------------------------------------
@@ -534,10 +570,12 @@ function sum(arr: Uint32Array): number {
  * bitstream overhead than it'd save.
  */
 function writeSubImage(writer: BitWriter, argb: Uint32Array, width: number, height: number): void {
-  // Sub-image header: no transforms, no color cache, no meta-Huffman.
-  writer.writeBit(0) // transform-present = 0 (no nested transforms)
+  // Sub-image header — mirrors libwebp's `DecodeImageStream(...,
+  // is_level0=0, ...)` exactly. Sub-images skip the top-level
+  // transform-present and meta-Huffman bits (those are gated by
+  // `is_level0`); they go straight to the (here always absent)
+  // color-cache flag.
   writer.writeBit(0) // color-cache present = 0
-  writer.writeBit(0) // meta-Huffman = 0
 
   const numPixels = width * height
   const greenFreq = new Uint32Array(GREEN_BASE)
@@ -575,6 +613,13 @@ function writeSubImage(writer: BitWriter, argb: Uint32Array, width: number, heig
   writeHuffmanTree(writer, blueLen)
   writeHuffmanTree(writer, alphaLen)
   writeHuffmanTree(writer, distLen)
+
+  // Match libwebp's 0-bits-per-read decode for single-symbol trees.
+  zeroIfSingleSymbol(greenLen)
+  zeroIfSingleSymbol(redLen)
+  zeroIfSingleSymbol(blueLen)
+  zeroIfSingleSymbol(alphaLen)
+  zeroIfSingleSymbol(distLen)
 
   const greenCodes = lengthsToCodes(greenLen)
   const redCodes = lengthsToCodes(redLen)

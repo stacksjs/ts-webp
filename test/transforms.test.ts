@@ -109,12 +109,26 @@ describe('compression — features should win on the right images', () => {
   // should compress better than baseline on at least one synthetic
   // pattern designed to exercise it.
 
-  it('LZ77 wins big on long single-colour runs', () => {
-    const img = makeImage(64, 64, () => [128, 128, 128, 255])
+  it('LZ77 helps on repeating multi-pixel runs', () => {
+    // 16-pixel motif tiled across a 64x64 image. Every motif boundary
+    // is a long matching run vs. the previous tile, which LZ77 picks
+    // up via its 3-pixel hash chain. We can't use a single-colour image
+    // for this assertion: with libwebp's 0-bits-per-read collapse for
+    // single-symbol trees (which our encoder mirrors), the no-LZ77
+    // baseline is already ~12 bytes of headers — LZ77 has nothing to
+    // beat. The 16-pixel motif keeps the green tree multi-symbol so
+    // both baseline and LZ77 paths emit real per-pixel bits and the
+    // backref savings actually show up in the size diff.
+    const motif = [
+      [10, 20, 30, 255], [10, 20, 30, 255], [10, 20, 30, 255], [10, 20, 30, 255],
+      [40, 50, 60, 255], [40, 50, 60, 255], [40, 50, 60, 255], [40, 50, 60, 255],
+      [70, 80, 90, 255], [70, 80, 90, 255], [70, 80, 90, 255], [70, 80, 90, 255],
+      [110, 120, 130, 255], [110, 120, 130, 255], [110, 120, 130, 255], [110, 120, 130, 255],
+    ]
+    const img = makeImage(64, 64, x => motif[x % 16])
     const baseline = expectRoundTrip(img, NO_FEATURES)
     const withLz77 = expectRoundTrip(img, { ...NO_FEATURES, useLZ77: true })
-    // Single-colour image should compress to a tiny fraction with LZ77.
-    expect(withLz77).toBeLessThan(baseline / 5)
+    expect(withLz77).toBeLessThan(baseline / 2)
   })
 
   it('subtract-green wins on R/G/B-correlated images', () => {

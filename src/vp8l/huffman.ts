@@ -348,7 +348,6 @@ export function writeHuffmanTree(writer: BitWriter, lengths: Uint8Array): void {
 
   // Build lengths for the meta-tree, capped at 7 bits per VP8L.
   const clLengths = buildCodeLengths(clFreq, 7)
-  const clCodes = lengthsToCodes(clLengths)
 
   // Number of code-length-codes to send: enough to cover the highest-index
   // non-zero entry in CODE_LENGTH_CODE_ORDER. VP8L always sends at least 4.
@@ -366,6 +365,15 @@ export function writeHuffmanTree(writer: BitWriter, lengths: Uint8Array): void {
   // bigger on the wire.
   writer.writeBit(0)
 
+  // libwebp's `BuildHuffmanTable` collapses any Huffman tree with a single
+  // non-zero entry to `bits = 0` per `ReadSymbol` — both the outer trees
+  // and the *meta-tree* used to encode this very length sequence. After
+  // the wire-form clLengths header above is on the wire, zero out the
+  // meta-tree's lengths if it's single-symbol, so per-length emit calls
+  // contribute zero bits and stay in sync with the decoder.
+  zeroIfSingleSymbolLocal(clLengths)
+  const clCodes = lengthsToCodes(clLengths)
+
   // Emit the symbol-length sequence using meta-tree codes (literal 0..15)
   // plus run codes (16/17/18). For now skip the run-length compression and
   // emit each length literally — saves complexity at the cost of a few
@@ -373,9 +381,29 @@ export function writeHuffmanTree(writer: BitWriter, lengths: Uint8Array): void {
   for (let s = 0; s < lengths.length; s++) {
     const len = lengths[s]
     const codeLen = clLengths[len]
+    if (codeLen === 0) continue
     const code = clCodes[len]
     writer.writeBits(reverseBits(code, codeLen), codeLen)
   }
+}
+
+/**
+ * If `lengths` has exactly one non-zero entry, zero it. Mirrors
+ * `BuildHuffmanTable`'s `bits = 0` collapse for single-symbol trees;
+ * downstream emit loops should treat `len === 0` as a no-op so the
+ * encoder matches the 0-bits-per-read decoder behaviour.
+ */
+function zeroIfSingleSymbolLocal(lengths: Uint8Array): void {
+  let nonZero = 0
+  let firstIdx = -1
+  for (let i = 0; i < lengths.length; i++) {
+    if (lengths[i] > 0) {
+      nonZero++
+      if (firstIdx < 0) firstIdx = i
+      if (nonZero > 1) return
+    }
+  }
+  if (nonZero === 1) lengths[firstIdx] = 0
 }
 
 // ---------------------------------------------------------------------------
@@ -440,13 +468,17 @@ export class HuffmanTree {
     }
 
     if (nonZero === 1) {
-      // Single-symbol tree: encoder still emits one canonical bit so the
-      // bitstream has a well-defined length. Decoder consumes the bit
-      // (its value is irrelevant) and returns the only symbol.
+      // Single-symbol tree: libwebp uses a 0-bit decode here — `readSymbol`
+      // consumes nothing and returns the only symbol. The encoder side
+      // still emits the simple-code *header* (4-11 bits to identify the
+      // single symbol), but per-pixel reads are free. We match that so
+      // libwebp-produced bitstreams (notably alpha planes encoded as
+      // VP8L with mostly-zero R/B/A channels) decode in lock-step.
       this.lutBits = 1
       this.lut = new Int32Array(2)
-      this.lut[0] = (firstLen << 16) | firstSym
-      this.lut[1] = (firstLen << 16) | firstSym
+      const leaf = (0 << 16) | firstSym
+      this.lut[0] = leaf
+      this.lut[1] = leaf
       this.built = true
       return
     }
@@ -609,34 +641,36 @@ export function readHuffmanTree(reader: BitReader, numSymbols: number): HuffmanT
   clTree.buildFromLengths(clLengths)
 
   const useLength = reader.readBit()
+  // `max_symbol` in libwebp is a *loop iteration* counter, not a code-length
+  // counter. Each loop iteration emits 1 (literal) or more (run code 16/17/18)
+  // code lengths, but only consumes 1 max_symbol budget. With `use_length=0`
+  // the cap defaults to numSymbols — generous enough that the loop almost
+  // always exits via the symbol-counter check first.
   let maxSymbol = numSymbols
   if (useLength) {
     const lengthNbits = 2 + 2 * reader.readBits(3)
     maxSymbol = 2 + reader.readBits(lengthNbits)
+    if (maxSymbol > numSymbols) maxSymbol = numSymbols
   }
 
   const lengths = new Uint8Array(numSymbols)
   let prevLen = 8
-  let count = 0
   let i = 0
-  while (i < numSymbols && count < maxSymbol) {
+  while (i < numSymbols) {
+    if (maxSymbol-- === 0) break
     const code = clTree.readSymbol(reader)
     if (code < 16) {
       lengths[i++] = code
       if (code !== 0) prevLen = code
-      count++
     } else if (code === 16) {
       const repeat = 3 + reader.readBits(2)
       for (let j = 0; j < repeat && i < numSymbols; j++) lengths[i++] = prevLen
-      count += repeat
     } else if (code === 17) {
       const repeat = 3 + reader.readBits(3)
       for (let j = 0; j < repeat && i < numSymbols; j++) lengths[i++] = 0
-      count += repeat
     } else { // code === 18
       const repeat = 11 + reader.readBits(7)
       for (let j = 0; j < repeat && i < numSymbols; j++) lengths[i++] = 0
-      count += repeat
     }
   }
 

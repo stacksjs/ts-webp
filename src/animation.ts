@@ -1,5 +1,7 @@
 import type { WebpAnimation, WebpAnimationFrame } from './types'
+import { decodeAlpha } from './alpha'
 import { parseRiff } from './riff'
+import { decodeVP8 } from './vp8/decoder'
 import { decodeVP8L } from './vp8l/decoder'
 
 /**
@@ -97,14 +99,22 @@ function readUint24LE(data: Uint8Array, offset: number): number {
  *
  * Per the container spec, this isn't a full RIFF/WEBP — it's just a
  * sequence of `(fourCC, size, data)` chunk records. The frame's pixels
- * live in either a single `VP8L` chunk (lossless) or a `VP8 ` plus
- * optional `ALPH` (lossy + alpha) — we currently only handle the
- * VP8L path; lossy frames throw via the underlying VP8 decoder.
+ * live in one of:
+ *   • a single `VP8L` chunk (lossless frame), or
+ *   • a `VP8 ` chunk (lossy frame) optionally preceded by `ALPH` for
+ *     a separately-encoded alpha plane.
+ *
+ * The lossy path mirrors the simple-container `VP8X + ALPH + VP8 ` flow
+ * in `decoder.ts`, just without the outer RIFF wrapper. Frames whose
+ * declared ANMF dimensions disagree with the inner-chunk-decoded
+ * dimensions throw rather than silently misalign downstream blending.
  */
 function decodeFramePayload(payload: Uint8Array, expectedWidth: number, expectedHeight: number): import('./types').WebpImageData {
   const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength)
   let offset = 0
   let vp8lData: Uint8Array | null = null
+  let vp8Data: Uint8Array | null = null
+  let alphData: Uint8Array | null = null
 
   while (offset + 8 <= payload.length) {
     const fourCC = String.fromCharCode(
@@ -117,20 +127,43 @@ function decodeFramePayload(payload: Uint8Array, expectedWidth: number, expected
     const dataStart = offset + 8
     const dataEnd = Math.min(dataStart + size, payload.length)
     if (fourCC === 'VP8L') vp8lData = payload.subarray(dataStart, dataEnd)
+    else if (fourCC === 'VP8 ') vp8Data = payload.subarray(dataStart, dataEnd)
+    else if (fourCC === 'ALPH') alphData = payload.subarray(dataStart, dataEnd)
     // Pad to even boundary.
     const padded = size + (size & 1)
     offset = dataStart + padded
   }
 
-  if (!vp8lData) {
-    throw new Error('ts-webp: animation frame has no VP8L chunk (lossy frames not supported)')
+  // VP8L wins over VP8 if both are present (rare, but the spec allows it).
+  if (vp8lData) {
+    const decoded = decodeVP8L(vp8lData)
+    if (decoded.width !== expectedWidth || decoded.height !== expectedHeight) {
+      throw new Error(
+        `ts-webp: ANMF declared frame ${expectedWidth}×${expectedHeight}`
+        + ` but VP8L decoded ${decoded.width}×${decoded.height}`,
+      )
+    }
+    return decoded
   }
-  const decoded = decodeVP8L(vp8lData)
-  if (decoded.width !== expectedWidth || decoded.height !== expectedHeight) {
-    throw new Error(
-      `ts-webp: ANMF declared frame ${expectedWidth}×${expectedHeight}`
-      + ` but VP8L decoded ${decoded.width}×${decoded.height}`,
-    )
+
+  if (vp8Data) {
+    const decoded = decodeVP8(vp8Data)
+    if (decoded.width !== expectedWidth || decoded.height !== expectedHeight) {
+      throw new Error(
+        `ts-webp: ANMF declared frame ${expectedWidth}×${expectedHeight}`
+        + ` but VP8 decoded ${decoded.width}×${decoded.height}`,
+      )
+    }
+    if (alphData) {
+      const alpha = decodeAlpha(alphData, decoded.width, decoded.height)
+      const px = decoded.width * decoded.height
+      for (let i = 0; i < px; i++) {
+        decoded.data[i * 4 + 3] = alpha[i]
+      }
+      decoded.hasAlpha = true
+    }
+    return decoded
   }
-  return decoded
+
+  throw new Error('ts-webp: animation frame has no VP8L or VP8 chunk')
 }
