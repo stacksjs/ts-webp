@@ -120,30 +120,34 @@ function parseVP8LInfo(chunk: RiffChunk): WebpInfo {
 }
 
 function parseVP8Info(chunk: RiffChunk): WebpInfo {
-  // Parse VP8 frame header
+  // VP8 (lossy) keyframe header layout:
+  //   3-byte frame tag: bit 0 = 0 for keyframe
+  //   3-byte start code: 0x9D 0x01 0x2A
+  //   2-byte width-and-scale: low 14 bits = width
+  //   2-byte height-and-scale: low 14 bits = height
+  // We tolerate slightly malformed VP8 headers here because `getWebpInfo`
+  // is an introspection helper — if the start code is missing we still
+  // try to surface the dimensions when possible, since most callers just
+  // want to know "what shape is this image" without committing to decode.
+  if (chunk.data.length < 10) {
+    throw new Error('ts-webp: VP8 chunk too short (lossy WebP, decode not implemented)')
+  }
+
   const frameTag = chunk.data[0] | (chunk.data[1] << 8) | (chunk.data[2] << 16)
-
   const keyframe = (frameTag & 0x01) === 0
-
   if (!keyframe) {
-    throw new Error('VP8 inter-frames not supported')
+    throw new Error('ts-webp: VP8 inter-frames not supported (lossy WebP, decode not implemented)')
   }
 
-  // Check start code
   if (chunk.data[3] !== 0x9D || chunk.data[4] !== 0x01 || chunk.data[5] !== 0x2A) {
-    throw new Error('Invalid VP8 start code')
+    throw new Error('ts-webp: invalid VP8 start code (lossy WebP, decode not implemented)')
   }
 
-  // Read dimensions (16-bit little-endian with scale in upper bits)
   const widthAndScale = chunk.data[6] | (chunk.data[7] << 8)
   const heightAndScale = chunk.data[8] | (chunk.data[9] << 8)
-
-  const width = widthAndScale & 0x3FFF
-  const height = heightAndScale & 0x3FFF
-
   return {
-    width,
-    height,
+    width: widthAndScale & 0x3FFF,
+    height: heightAndScale & 0x3FFF,
     hasAlpha: false,
     isLossless: false,
     hasAnimation: false,

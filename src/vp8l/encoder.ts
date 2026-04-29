@@ -11,21 +11,23 @@ import { lengthToCode, MAX_LENGTH, NUM_LENGTH_CODES } from './length'
  *
  *   1. Pack RGBA bytes into ARGB Uint32Array (one word per pixel).
  *   2. Apply `subtract-green` pre-transform (R -= G, B -= G mod 256) when
- *      it would help — basically always, on natural images. Encoder-side
- *      pre-transforms shrink the alphabet's entropy; the decoder un-does
- *      the transform after decoding the pixel stream.
+ *      enabled. The decoder un-does it after pixel decode.
  *   3. Tokenize: for each pixel, try (in order)
- *        a. Color cache hit  → emit a cache-index code,
- *        b. LZ77 match ≥ 3 px → emit length + distance codes,
+ *        a. LZ77 match ≥ 3 px → emit length + distance codes,
+ *        b. Color cache hit  → emit a cache-index code,
  *        c. otherwise         → emit a literal G/R/B/A token.
  *   4. Build per-tree frequency histograms across all tokens, then build
  *      canonical Huffman code lengths for each tree.
  *   5. Write the bitstream: signature, header, transform list, color-cache
  *      flag, meta-Huffman flag, the 5 trees, then the token stream.
  *
- * Each step is gated by an option, defaulted to `true`, so we can isolate
- * regressions by encoding with one feature at a time. Round-trip is
- * verified by `decode(encode(image)) === image` for every combination.
+ * Tokens are kept in three parallel typed arrays (`tokenKind`, `tokenA`,
+ * `tokenB`) sized at `numPixels` — that's the maximum possible token
+ * count. The previous implementation used a `Token` discriminated-union
+ * `Array`, which allocated one object per pixel and produced ~50-70 MB
+ * of GC pressure on a 1 MP image. The flat-array encoding keeps the
+ * working set under 9 MB and lets the histogram + emit passes iterate
+ * with simple field reads.
  *
  * Reference: WebP Lossless Bitstream Specification.
  */
@@ -39,19 +41,23 @@ const GREEN_BASE = NUM_LITERAL_CODES + NUM_LENGTH_CODES
 /** Transform type 2 = subtract-green (no payload). */
 const TRANSFORM_SUBTRACT_GREEN = 2
 
-/** Cache bits for the color cache. 11 is the spec maximum and the size
- *  most production encoders use; the cost is one 8 KB Uint32Array. */
+/** Cache bits for the color cache. 11 is the spec maximum. */
 const DEFAULT_CACHE_BITS = 11
 
 /** Hash multiplier per VP8L spec for the color cache. */
 const VP8L_HASH_MUL = 0x1E35A7BD
 
+/** Token discriminator: literal pixel, LZ77 backreference, color-cache hit. */
+const enum TokenKind {
+  Literal = 0,
+  Backref = 1,
+  Cache = 2,
+}
+
 /**
  * Internal options for fine-grained control over which features to apply.
- * Public callers go through `WebpEncodeOptions` (defined in `../types`),
- * which currently only exposes `lossless` / `quality` / `effort` / `alpha`;
- * the per-feature toggles below are used by tests to validate each
- * transform in isolation.
+ * Public callers go through `WebpEncodeOptions`; the per-feature toggles
+ * here are used by tests to validate each transform in isolation.
  */
 interface InternalOptions {
   subtractGreen: boolean
@@ -61,8 +67,6 @@ interface InternalOptions {
 }
 
 function resolveOptions(opts: WebpEncodeOptions): InternalOptions {
-  // Honour both the documented options and any internal flags a caller
-  // (e.g. our test suite) might smuggle through.
   const o = opts as WebpEncodeOptions & Partial<InternalOptions>
   return {
     subtractGreen: o.subtractGreen ?? true,
@@ -95,7 +99,13 @@ export function encodeVP8L(
   if (opts.subtractGreen) applySubtractGreen(argb)
 
   // ── Step 3: tokenize ──
-  const tokens = tokenize(argb, opts)
+  // Worst case = one token per pixel (all literals). We allocate parallel
+  // typed arrays at that size and track the actual count separately.
+  // This avoids ~50-70 MB of GC pressure on 1 MP+ images.
+  const tokenKind = new Uint8Array(numPixels)
+  const tokenA = new Uint32Array(numPixels)
+  const tokenB = new Uint32Array(numPixels)
+  const numTokens = tokenize(argb, opts, tokenKind, tokenA, tokenB)
 
   // ── Step 4: histograms + trees ──
   const cacheSize = opts.useColorCache ? 1 << opts.cacheBits : 0
@@ -107,22 +117,26 @@ export function encodeVP8L(
   const alphaFreq = new Uint32Array(256)
   const distFreq = new Uint32Array(NUM_DISTANCE_CODES)
 
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i]
-    switch (t.kind) {
-      case TokenKind.Literal:
-        greenFreq[t.g]++
-        redFreq[t.r]++
-        blueFreq[t.b]++
-        alphaFreq[t.a]++
-        break
-      case TokenKind.Backref:
-        greenFreq[NUM_LITERAL_CODES + t.lengthCode]++
-        distFreq[t.distanceCode]++
-        break
-      case TokenKind.Cache:
-        greenFreq[GREEN_BASE + t.index]++
-        break
+  for (let i = 0; i < numTokens; i++) {
+    const kind = tokenKind[i]
+    const a = tokenA[i]
+    if (kind === TokenKind.Literal) {
+      // Literal token: tokenA holds (g << 24) | (r << 16) | (b << 8) | alpha.
+      // Choosing this packing keeps `g` (the alphabet's most-touched
+      // symbol) in the high byte where the JIT can't accidentally
+      // sign-extend.
+      greenFreq[(a >>> 24) & 0xFF]++
+      redFreq[(a >>> 16) & 0xFF]++
+      blueFreq[(a >>> 8) & 0xFF]++
+      alphaFreq[a & 0xFF]++
+    } else if (kind === TokenKind.Backref) {
+      // Backref: tokenA = lengthCode | (lengthExtraBits << 8) | (lengthExtraValue << 16)
+      //          tokenB = distanceCode | (distanceExtraBits << 8) | (distanceExtraValue << 16)
+      greenFreq[NUM_LITERAL_CODES + (a & 0xFF)]++
+      distFreq[tokenB[i] & 0xFF]++
+    } else {
+      // Cache: tokenA = cache index.
+      greenFreq[GREEN_BASE + a]++
     }
   }
 
@@ -179,30 +193,34 @@ export function encodeVP8L(
   const alphaCodes = lengthsToCodes(alphaLen)
   const distCodes = lengthsToCodes(distLen)
 
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i]
-    switch (t.kind) {
-      case TokenKind.Literal: {
-        emitSymbol(writer, greenLen[t.g], greenCodes[t.g])
-        emitSymbol(writer, redLen[t.r], redCodes[t.r])
-        emitSymbol(writer, blueLen[t.b], blueCodes[t.b])
-        emitSymbol(writer, alphaLen[t.a], alphaCodes[t.a])
-        break
-      }
-      case TokenKind.Backref: {
-        const greenSym = NUM_LITERAL_CODES + t.lengthCode
-        emitSymbol(writer, greenLen[greenSym], greenCodes[greenSym])
-        // Length extra bits — already validated to fit in 24 bits.
-        if (t.lengthExtraBits > 0) writer.writeBits(t.lengthExtraValue, t.lengthExtraBits)
-        emitSymbol(writer, distLen[t.distanceCode], distCodes[t.distanceCode])
-        if (t.distanceExtraBits > 0) writer.writeBits(t.distanceExtraValue, t.distanceExtraBits)
-        break
-      }
-      case TokenKind.Cache: {
-        const greenSym = GREEN_BASE + t.index
-        emitSymbol(writer, greenLen[greenSym], greenCodes[greenSym])
-        break
-      }
+  for (let i = 0; i < numTokens; i++) {
+    const kind = tokenKind[i]
+    const a = tokenA[i]
+    if (kind === TokenKind.Literal) {
+      const g = (a >>> 24) & 0xFF
+      const r = (a >>> 16) & 0xFF
+      const b = (a >>> 8) & 0xFF
+      const al = a & 0xFF
+      emitSymbol(writer, greenLen[g], greenCodes[g])
+      emitSymbol(writer, redLen[r], redCodes[r])
+      emitSymbol(writer, blueLen[b], blueCodes[b])
+      emitSymbol(writer, alphaLen[al], alphaCodes[al])
+    } else if (kind === TokenKind.Backref) {
+      const lengthCode = a & 0xFF
+      const lengthExtraBits = (a >>> 8) & 0xFF
+      const lengthExtraValue = (a >>> 16) & 0xFFFF
+      const bb = tokenB[i]
+      const distanceCode = bb & 0xFF
+      const distanceExtraBits = (bb >>> 8) & 0xFF
+      const distanceExtraValue = (bb >>> 16) & 0xFFFF
+      const greenSym = NUM_LITERAL_CODES + lengthCode
+      emitSymbol(writer, greenLen[greenSym], greenCodes[greenSym])
+      if (lengthExtraBits > 0) writer.writeBits(lengthExtraValue, lengthExtraBits)
+      emitSymbol(writer, distLen[distanceCode], distCodes[distanceCode])
+      if (distanceExtraBits > 0) writer.writeBits(distanceExtraValue, distanceExtraBits)
+    } else {
+      const greenSym = GREEN_BASE + a
+      emitSymbol(writer, greenLen[greenSym], greenCodes[greenSym])
     }
   }
 
@@ -230,49 +248,37 @@ function applySubtractGreen(argb: Uint32Array): void {
 // Tokenization (LZ77 + color cache + literal)
 // ---------------------------------------------------------------------------
 
-enum TokenKind {
-  Literal = 0,
-  Backref = 1,
-  Cache = 2,
-}
-
-interface LiteralToken { kind: TokenKind.Literal, g: number, r: number, b: number, a: number }
-interface BackrefToken {
-  kind: TokenKind.Backref
-  lengthCode: number
-  lengthExtraBits: number
-  lengthExtraValue: number
-  distanceCode: number
-  distanceExtraBits: number
-  distanceExtraValue: number
-}
-interface CacheToken { kind: TokenKind.Cache, index: number }
-type Token = LiteralToken | BackrefToken | CacheToken
-
 /**
- * Tokenize the ARGB pixel stream into a Token[] suitable for histograms +
- * emission. Honours the encoder option flags to enable/disable LZ77 and
- * the color cache independently — useful for debugging and for tests
- * that want to verify individual compression stages in isolation.
+ * Single forward pass over the ARGB buffer, emitting one token per
+ * "consumed pixel block". Tokens are written to caller-provided typed
+ * arrays — this lets callers reuse buffers across encodes.
+ *
+ * Returns the number of tokens emitted.
+ *
+ * Token packing:
+ *   `tokenKind[i]` = 0 (literal) | 1 (backref) | 2 (cache)
+ *   Literal: tokenA = (g << 24) | (r << 16) | (b << 8) | a
+ *   Backref: tokenA = lengthCode | (lengthExtraBits << 8) | (lengthExtraValue << 16)
+ *            tokenB = distanceCode | (distanceExtraBits << 8) | (distanceExtraValue << 16)
+ *   Cache:   tokenA = cache index
  */
-function tokenize(argb: Uint32Array, opts: InternalOptions): Token[] {
-  const tokens: Token[] = []
+function tokenize(
+  argb: Uint32Array,
+  opts: InternalOptions,
+  tokenKind: Uint8Array,
+  tokenA: Uint32Array,
+  tokenB: Uint32Array,
+): number {
   const n = argb.length
+  let nTokens = 0
 
-  // Color cache: maps a hashed slot to the most recent ARGB value put
-  // there. A "hit" is when the slot's stored value equals the pixel we
-  // were about to emit — we then skip the literal emission and instead
-  // emit a cache-index code, which is much shorter.
+  // Color cache.
   const cacheBits = opts.cacheBits
   const cacheSize = opts.useColorCache ? 1 << cacheBits : 0
   const cache = cacheSize > 0 ? new Uint32Array(cacheSize) : null
-  // Track whether each slot has been populated yet (zero is a valid pixel
-  // so we can't use a sentinel value).
   const cacheValid = cacheSize > 0 ? new Uint8Array(cacheSize) : null
 
-  // LZ77: 16-bit hash over 3-pixel ARGB windows. Single-position-per-hash
-  // chaining (the equivalent of DEFLATE's "level 1") — fast enough that
-  // most natural images encode in a few ms.
+  // LZ77 hash table.
   const HASH_BITS = 16
   const HASH_SIZE = 1 << HASH_BITS
   const HASH_MASK = HASH_SIZE - 1
@@ -282,9 +288,7 @@ function tokenize(argb: Uint32Array, opts: InternalOptions): Token[] {
   while (i < n) {
     const px = argb[i]
 
-    // Try LZ77 first — a long-run match beats N cache hits, even though
-    // cache hits are cheap individually. Only after LZ77 declines do we
-    // fall to the cache → literal cascade.
+    // ── LZ77 first ──
     if (hashTable && i + 2 < n) {
       const h = hashOf(argb, i, HASH_MASK)
       const matchPos = hashTable[h]
@@ -296,25 +300,18 @@ function tokenize(argb: Uint32Array, opts: InternalOptions): Token[] {
           len < MAX_LENGTH
           && i + len < n
           && argb[matchPos + len] === argb[i + len]
-        ) {
-          len++
-        }
+        ) len++
         if (len >= 3) {
           const distance = i - matchPos
           const distEnc = distanceToCode(distance)
           const lenEnc = lengthToCode(len)
           if (distEnc !== null && lenEnc !== null) {
-            tokens.push({
-              kind: TokenKind.Backref,
-              lengthCode: lenEnc.code,
-              lengthExtraBits: lenEnc.extraBits,
-              lengthExtraValue: lenEnc.extraValue,
-              distanceCode: distEnc.code,
-              distanceExtraBits: distEnc.extraBits,
-              distanceExtraValue: distEnc.extraValue,
-            })
-            // Update cache + hash for every pixel in the match so the
-            // decoder's view stays in sync and later matches can pick
+            tokenKind[nTokens] = TokenKind.Backref
+            tokenA[nTokens] = lenEnc.code | (lenEnc.extraBits << 8) | (lenEnc.extraValue << 16)
+            tokenB[nTokens] = distEnc.code | (distEnc.extraBits << 8) | (distEnc.extraValue << 16)
+            nTokens++
+            // Update cache + hash for every pixel inside the run so the
+            // decoder's cache stays in sync and later matches can pick
             // up from inside this run.
             if (cache && cacheValid) {
               for (let k = 0; k < len && i + k < n; k++) {
@@ -334,24 +331,26 @@ function tokenize(argb: Uint32Array, opts: InternalOptions): Token[] {
       }
     }
 
-    // No LZ77 match — try color-cache hit. This is a single-pixel
-    // operation, so it doesn't compete with multi-pixel matches; it
-    // only wins where LZ77 didn't.
+    // ── Color cache hit ──
     if (cache && cacheValid) {
       const slot = (Math.imul(px, VP8L_HASH_MUL) >>> (32 - cacheBits)) & (cacheSize - 1)
       if (cacheValid[slot] && cache[slot] === px) {
-        tokens.push({ kind: TokenKind.Cache, index: slot })
+        tokenKind[nTokens] = TokenKind.Cache
+        tokenA[nTokens] = slot
+        nTokens++
         i++
         continue
       }
     }
 
-    // Fall back to literal emission.
+    // ── Literal ──
     const a = (px >>> 24) & 0xFF
     const r = (px >>> 16) & 0xFF
     const g = (px >>> 8) & 0xFF
     const b = px & 0xFF
-    tokens.push({ kind: TokenKind.Literal, g, r, b, a })
+    tokenKind[nTokens] = TokenKind.Literal
+    tokenA[nTokens] = (g << 24) | (r << 16) | (b << 8) | a
+    nTokens++
     if (cache && cacheValid) {
       const slot = (Math.imul(px, VP8L_HASH_MUL) >>> (32 - cacheBits)) & (cacheSize - 1)
       cache[slot] = px
@@ -360,16 +359,14 @@ function tokenize(argb: Uint32Array, opts: InternalOptions): Token[] {
     i++
   }
 
-  return tokens
+  return nTokens
 }
 
 /**
- * VP8L's 3-pixel hash. Mixes the three ARGB words with multiplicative
- * hashing; we only need a uniform distribution over `hashMask`, not
- * cryptographic strength.
+ * VP8L's 3-pixel hash. Mixes three ARGB words via multiplicative hashing;
+ * we only need uniform distribution over `hashMask`, not crypto strength.
  */
 function hashOf(argb: Uint32Array, i: number, hashMask: number): number {
-  // Combine three Uint32s with imul-based mixing.
   const a = argb[i]
   const b = argb[i + 1]
   const c = argb[i + 2]

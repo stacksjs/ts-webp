@@ -54,50 +54,105 @@ export function buildCodeLengths(freq: Uint32Array | number[], maxBits = MAX_COD
   const n = freq.length
   const lengths = new Uint8Array(n)
 
-  type Node = { weight: number, sym: number, left?: Node, right?: Node }
-  const heap: Node[] = []
-  for (let s = 0; s < n; s++) {
-    const w = (freq as ArrayLike<number>)[s]
-    if (w > 0) heap.push({ weight: w, sym: s })
+  // Build standard Huffman with a real binary min-heap. The previous
+  // implementation used `Array.shift()` + `Array.splice()`, both O(n);
+  // that's quadratic in the alphabet size, which is fine for 280-symbol
+  // trees but visible at 2328 symbols (the green/length tree's max with
+  // 11-bit cache). Real heap is O(n log n).
+  //
+  // Layout: `nodeWeight`, `nodeSym`, `nodeLeft`, `nodeRight` are parallel
+  // arrays indexed by node ID. ID 0 is reserved as "no node" sentinel,
+  // which is convenient because uninitialised heap slots are 0. Leaves
+  // get `sym ≥ 0`; internal nodes get `sym = -1`.
+  const cap = n * 2 + 1 // upper bound: n leaves + (n-1) internal + sentinel
+  const nodeWeight = new Uint32Array(cap)
+  const nodeSym = new Int32Array(cap)
+  const nodeLeft = new Int32Array(cap)
+  const nodeRight = new Int32Array(cap)
+  let nextNode = 1
+
+  // Min-heap of node IDs ordered by weight; classic binary heap.
+  const heap = new Int32Array(n + 1)
+  let heapSize = 0
+
+  function heapPush(id: number): void {
+    let i = heapSize++
+    heap[i] = id
+    // Sift up.
+    while (i > 0) {
+      const parent = (i - 1) >>> 1
+      if (nodeWeight[heap[parent]] <= nodeWeight[heap[i]]) break
+      const t = heap[parent]; heap[parent] = heap[i]; heap[i] = t
+      i = parent
+    }
   }
 
-  if (heap.length === 0) return lengths
-  if (heap.length === 1) {
-    lengths[heap[0].sym] = 1
+  function heapPop(): number {
+    const top = heap[0]
+    heap[0] = heap[--heapSize]
+    // Sift down.
+    let i = 0
+    while (true) {
+      const l = 2 * i + 1
+      const r = 2 * i + 2
+      let smallest = i
+      if (l < heapSize && nodeWeight[heap[l]] < nodeWeight[heap[smallest]]) smallest = l
+      if (r < heapSize && nodeWeight[heap[r]] < nodeWeight[heap[smallest]]) smallest = r
+      if (smallest === i) break
+      const t = heap[smallest]; heap[smallest] = heap[i]; heap[i] = t
+      i = smallest
+    }
+    return top
+  }
+
+  // Seed leaves.
+  for (let s = 0; s < n; s++) {
+    const w = (freq as ArrayLike<number>)[s]
+    if (w > 0) {
+      const id = nextNode++
+      nodeWeight[id] = w
+      nodeSym[id] = s
+      heapPush(id)
+    }
+  }
+
+  if (heapSize === 0) return lengths
+  if (heapSize === 1) {
+    lengths[nodeSym[heap[0]]] = 1
     return lengths
   }
 
-  // Sort ascending. We use sorted-insert instead of a real heap because n
-  // is small (≤ 2328 for VP8L) and `Array.splice` is fine at that scale.
-  heap.sort((a, b) => a.weight - b.weight)
-  while (heap.length > 1) {
-    const a = heap.shift()!
-    const b = heap.shift()!
-    const m: Node = { weight: a.weight + b.weight, sym: -1, left: a, right: b }
-    // Binary-insert m to keep the array sorted.
-    let lo = 0
-    let hi = heap.length
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1
-      if (heap[mid].weight <= m.weight) lo = mid + 1
-      else hi = mid
-    }
-    heap.splice(lo, 0, m)
+  // Merge until one node remains.
+  while (heapSize > 1) {
+    const a = heapPop()
+    const b = heapPop()
+    const m = nextNode++
+    nodeWeight[m] = nodeWeight[a] + nodeWeight[b]
+    nodeSym[m] = -1
+    nodeLeft[m] = a
+    nodeRight[m] = b
+    heapPush(m)
   }
+  const root = heap[0]
 
-  // Walk the tree to assign per-symbol lengths.
-  // Iterative walk to avoid stack overflow on deeply unbalanced trees.
-  type Frame = { node: Node, depth: number }
-  const stack: Frame[] = [{ node: heap[0], depth: 0 }]
-  while (stack.length > 0) {
-    const f = stack.pop()!
-    if (f.node.sym >= 0) {
-      // Single-leaf tree (only one symbol with non-zero freq) gets depth 0
-      // from the walk; force it to 1 so we always emit at least one bit.
-      lengths[f.node.sym] = Math.max(f.depth, 1)
+  // Iterative walk to assign per-symbol depths. Stack avoids recursion
+  // overflow on pathologically unbalanced trees.
+  const walkStack = new Int32Array(cap * 2) // pairs of (node, depth)
+  let walkTop = 0
+  walkStack[walkTop++] = root
+  walkStack[walkTop++] = 0
+  while (walkTop > 0) {
+    const depth = walkStack[--walkTop]
+    const id = walkStack[--walkTop]
+    if (nodeSym[id] >= 0) {
+      // Single-leaf trees would get depth 0 — force ≥ 1 so we always
+      // emit at least one bit per symbol on the wire.
+      lengths[nodeSym[id]] = depth > 0 ? depth : 1
     } else {
-      stack.push({ node: f.node.left!, depth: f.depth + 1 })
-      stack.push({ node: f.node.right!, depth: f.depth + 1 })
+      walkStack[walkTop++] = nodeLeft[id]
+      walkStack[walkTop++] = depth + 1
+      walkStack[walkTop++] = nodeRight[id]
+      walkStack[walkTop++] = depth + 1
     }
   }
 
@@ -328,19 +383,32 @@ export function writeHuffmanTree(writer: BitWriter, lengths: Uint8Array): void {
 // ---------------------------------------------------------------------------
 
 /**
- * A built Huffman tree ready to read symbols from a bitstream.
+ * A built Huffman tree, ready to decode symbols from a bitstream.
  *
- * Internally a primary LUT for codes ≤ `lutBits` resolves the common case
- * in O(1); longer codes use a packed binary tree (`Int16Array` parent →
- * (left, right) child indices) walked bit-by-bit.
+ * Storage is a single flat `Int32Array` holding a primary LUT followed
+ * by zero or more secondary LUTs ("subtables") — the standard two-level
+ * scheme used by every fast inflate decoder. Codes whose length fits in
+ * the primary LUT (≤ 8 bits) decode in one peek + consume; longer codes
+ * decode via a secondary LUT lookup with no tree walk.
+ *
+ * Entry encoding (`Int32` per slot):
+ *   - Non-negative entry → leaf:
+ *       bits 16..23 = code length (1..maxLen)
+ *       bits 0..15  = symbol (alphabet is ≤ 2328, fits in 16 bits)
+ *   - Negative entry → subtable pointer:
+ *       bits 0..23   = offset into `lut` of the subtable's first slot
+ *       bits 24..30  = subtable size in bits (so subtable has `1 << subBits` entries)
+ *       bit 31       = 1 (the sign bit, used as the discriminator)
+ *
+ * Subtable leaf entries store the *extra* code length beyond the primary
+ * 8 bits in the same `bits 16..23` slot, so the consumer in `readSymbol`
+ * adds 8 to that count when computing total bits to consume.
  */
 export class HuffmanTree {
-  private lut!: Int32Array // (codeLen << 16) | symbol, or -1 if no entry
-  private lutBits!: number
-  /** Tree storage: node `i` lives at `tree[i*2]` (left), `tree[i*2+1]` (right). Leaves encode `-(symbol+1)`. */
-  private tree!: Int32Array
-  private treeNext = 0
-  /** `true` once buildFromLengths has completed; cheap guard against decoding from a half-built tree. */
+  private lut!: Int32Array
+  /** Bits consumed by the primary LUT (always 8 unless the alphabet has only short codes). */
+  private lutBits = 8
+  /** Set once `buildFromLengths` completes; cheap guard against decoding from a half-built tree. */
   private built = false
 
   /**
@@ -352,112 +420,152 @@ export class HuffmanTree {
     const n = lengths.length
     let maxLen = 0
     let nonZero = 0
+    let firstSym = -1
+    let firstLen = 1
     for (let i = 0; i < n; i++) {
       const len = (lengths as ArrayLike<number>)[i]
       if (len > 0) {
         nonZero++
         if (len > maxLen) maxLen = len
+        if (firstSym < 0) { firstSym = i; firstLen = len }
       }
     }
 
-    // LUT covers the first `lutBits` bits of every code. Pick the smaller
-    // of 8 and `maxLen`: a smaller LUT is faster to build and just as fast
-    // to read; an 8-bit LUT for a code with maxLen=4 wastes 240 entries.
-    this.lutBits = Math.min(8, Math.max(1, maxLen))
-    this.lut = new Int32Array(1 << this.lutBits).fill(-1)
-    // Tree size bound: complete binary tree of depth maxLen has at most
-    // 2 * 2^maxLen nodes, but a Huffman tree with N leaves has 2N-1 nodes
-    // total. Use the tighter bound to avoid allocating ~64KB for small
-    // alphabets.
-    this.tree = new Int32Array(2 * Math.max(2 * nonZero, 2))
-    this.treeNext = 1 // node 0 is the root
-
+    // ── Edge cases ──
     if (nonZero === 0) {
+      this.lutBits = 1
+      this.lut = new Int32Array(2).fill(-1)
       this.built = true
       return
     }
 
     if (nonZero === 1) {
-      // Single-symbol tree: the encoder still emits one canonical bit
-      // (length-1 code value 0) so the bit stream has a well-defined
-      // length. The decoder must consume that bit to keep its cursor
-      // aligned, even though there's only one possible symbol.
-      let onlySym = 0
-      let onlyLen = 1
-      for (let i = 0; i < n; i++) {
-        const len = (lengths as ArrayLike<number>)[i]
-        if (len > 0) { onlySym = i; onlyLen = len; break }
-      }
-      // LUT covers `lutBits` peeked bits; for any peek, return `(onlyLen, onlySym)`
-      // so readSymbol consumes `onlyLen` bits and returns the single symbol.
-      for (let i = 0; i < this.lut.length; i++) this.lut[i] = (onlyLen << 16) | onlySym
+      // Single-symbol tree: encoder still emits one canonical bit so the
+      // bitstream has a well-defined length. Decoder consumes the bit
+      // (its value is irrelevant) and returns the only symbol.
+      this.lutBits = 1
+      this.lut = new Int32Array(2)
+      this.lut[0] = (firstLen << 16) | firstSym
+      this.lut[1] = (firstLen << 16) | firstSym
       this.built = true
       return
     }
 
-    // Build canonical codes.
-    const codes = lengthsToCodes(lengths instanceof Uint8Array ? lengths : new Uint8Array(lengths))
+    // ── Primary LUT size ──
+    // For trees whose max code length fits in the primary, use a smaller
+    // LUT — saves both build time and per-decode peek cost. For longer
+    // trees, always use 8-bit primary; the spec maxes lengths at 15 so
+    // the worst-case secondary table has 2^7 = 128 entries.
+    this.lutBits = maxLen <= 8 ? Math.max(1, maxLen) : 8
+    const primarySize = 1 << this.lutBits
 
-    // Insert each (length, symbol) into both LUT and tree.
+    // ── First pass: figure out how big each secondary table needs to be ──
+    // Group long codes by their primary 8-bit prefix; the prefix is the
+    // *reversed* code's low `lutBits` bits because that's what the wire
+    // peek returns.
+    const subBitsByPrefix = new Uint8Array(primarySize)
+    if (maxLen > this.lutBits) {
+      // Build canonical codes once so we can compute reversed prefixes.
+      const codesNorm = lengthsToCodes(lengths instanceof Uint8Array ? lengths : new Uint8Array(lengths))
+      for (let s = 0; s < n; s++) {
+        const len = (lengths as ArrayLike<number>)[s]
+        if (len <= this.lutBits) continue
+        const reversed = reverseBits(codesNorm[s], len)
+        const prefix = reversed & (primarySize - 1)
+        const extra = len - this.lutBits
+        if (extra > subBitsByPrefix[prefix]) subBitsByPrefix[prefix] = extra
+      }
+    }
+
+    // ── Allocate a single flat array for primary + all secondaries ──
+    let totalSize = primarySize
+    const subOffsetByPrefix = new Int32Array(primarySize).fill(-1)
+    for (let p = 0; p < primarySize; p++) {
+      if (subBitsByPrefix[p] > 0) {
+        subOffsetByPrefix[p] = totalSize
+        totalSize += 1 << subBitsByPrefix[p]
+      }
+    }
+    this.lut = new Int32Array(totalSize).fill(-1)
+
+    // Mark every primary slot that points to a secondary as a subtable
+    // pointer up-front. Subtable leaves get filled in the second pass;
+    // any primary slot that ends up with both a short-code leaf *and* a
+    // pointer is an impossible case for canonical Huffman (prefix codes
+    // are prefix-free), so we don't need to handle it.
+    for (let p = 0; p < primarySize; p++) {
+      if (subBitsByPrefix[p] > 0) {
+        // Subtable pointer: sign bit = 1, bits 24..30 = subBits, bits 0..23 = offset.
+        this.lut[p] = (0x80000000 | (subBitsByPrefix[p] << 24) | (subOffsetByPrefix[p] & 0xFFFFFF)) | 0
+      }
+    }
+
+    // ── Second pass: fill leaves ──
+    const codes = lengthsToCodes(lengths instanceof Uint8Array ? lengths : new Uint8Array(lengths))
     for (let s = 0; s < n; s++) {
       const len = (lengths as ArrayLike<number>)[s]
       if (len === 0) continue
       const code = codes[s]
       if (len <= this.lutBits) {
-        // Replicate across LUT entries that share these `len` low bits.
+        // Short code: replicate across primary LUT slots that share these
+        // `len` low bits.
         const reversed = reverseBits(code, len)
         const fill = 1 << (this.lutBits - len)
-        for (let i = 0; i < fill; i++) {
-          this.lut[reversed | (i << len)] = (len << 16) | s
-        }
+        const leaf = (len << 16) | s
+        for (let i = 0; i < fill; i++) this.lut[reversed | (i << len)] = leaf
       } else {
-        // Walk into the tree, allocating nodes as needed.
-        let node = 0
-        for (let bit = len - 1; bit >= 0; bit--) {
-          const direction = (code >> bit) & 1
-          const slot = node * 2 + direction
-          if (bit === 0) {
-            this.tree[slot] = -(s + 1)
-          } else {
-            if (this.tree[slot] === 0) {
-              if (this.treeNext * 2 + 1 >= this.tree.length) {
-                const grown = new Int32Array(this.tree.length * 2)
-                grown.set(this.tree)
-                this.tree = grown
-              }
-              this.tree[slot] = this.treeNext++
-            }
-            node = this.tree[slot]
-          }
-        }
+        // Long code: decompose into primary prefix + secondary suffix.
+        const reversed = reverseBits(code, len)
+        const prefix = reversed & (primarySize - 1)
+        const subOffset = subOffsetByPrefix[prefix]
+        const subBits = subBitsByPrefix[prefix]
+        const extraLen = len - this.lutBits
+        // The secondary index is the bits *after* the primary, which on
+        // the wire come *after* the primary too — same low-end bits of
+        // `reversed` shifted down by `lutBits`.
+        const subKey = reversed >>> this.lutBits
+        const fill = 1 << (subBits - extraLen)
+        // Subtable leaf encodes the *extra* length (beyond primary). The
+        // reader adds `lutBits` to it before consuming.
+        const leaf = (extraLen << 16) | s
+        for (let i = 0; i < fill; i++) this.lut[subOffset + (subKey | (i << extraLen))] = leaf
       }
     }
 
     this.built = true
   }
 
-  /** Read one symbol. Fast path = LUT, fallback = tree walk for long codes. */
+  /**
+   * Read one symbol. Two-level LUT lookup:
+   *   1. peek `lutBits` → primary entry
+   *   2. if leaf, consume + return
+   *   3. else (subtable pointer), consume primary, peek `subBits` → leaf, consume extra
+   *
+   * Average case is one peek + one consume per symbol (the primary path);
+   * the worst case is two peeks + two consumes for the longest codes,
+   * still bounded and O(1).
+   */
   readSymbol(reader: BitReader): number {
     if (!this.built) throw new Error('HuffmanTree.readSymbol called before buildFromLengths')
-    const peek = reader.peek(this.lutBits)
-    const entry = this.lut[peek]
+    const primary = reader.peek(this.lutBits)
+    const entry = this.lut[primary]
     if (entry >= 0) {
-      const len = entry >>> 16
+      const len = (entry >>> 16) & 0xFF
       reader.consume(len)
       return entry & 0xFFFF
     }
-    // LUT miss → walk the tree from the root, consuming one bit at a time.
-    // peek() didn't advance the cursor, so the tree walk re-reads the bits
-    // we used as the LUT key — exactly what's wanted, since the tree path
-    // encodes the *full* canonical code from MSB to LSB.
-    let node = 0
-    while (true) {
-      const direction = reader.readBit()
-      const child = this.tree[node * 2 + direction]
-      if (child < 0) return -(child + 1)
-      if (child === 0) throw new Error('Invalid Huffman code: walked into uninitialised node')
-      node = child
+    // Subtable lookup.
+    const subBits = (entry >>> 24) & 0x7F
+    const subOffset = entry & 0xFFFFFF
+    reader.consume(this.lutBits)
+    const subKey = reader.peek(subBits)
+    const subEntry = this.lut[subOffset + subKey]
+    if (subEntry < 0) {
+      throw new Error('Invalid Huffman code: subtable miss')
     }
+    const extraLen = (subEntry >>> 16) & 0xFF
+    reader.consume(extraLen)
+    return subEntry & 0xFFFF
   }
 }
 
