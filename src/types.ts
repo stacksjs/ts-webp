@@ -79,3 +79,50 @@ export interface VP8LHeader {
   hasAlpha: boolean
   version: number
 }
+
+/**
+ * One frame of an animated WebP, with positioning and timing metadata
+ * pulled from the surrounding ANMF chunk header.
+ */
+export interface WebpAnimationFrame {
+  /** Decoded RGBA pixel data for the frame's bounding box. */
+  image: WebpImageData
+  /** X offset (in pixels) where the frame is composited onto the canvas. */
+  x: number
+  /** Y offset where the frame is composited onto the canvas. */
+  y: number
+  /** Display duration of the frame in milliseconds. */
+  duration: number
+  /**
+   * Blending mode for compositing this frame onto the canvas:
+   *   - 'overlay' = alpha-composite over previous frame
+   *   - 'replace' = overwrite previous frame's pixels in this rectangle
+   */
+  blend: 'overlay' | 'replace'
+  /**
+   * What to do with the canvas after this frame is shown:
+   *   - 'none'       = leave the canvas as-is for the next frame
+   *   - 'background' = restore the rectangle to the background colour
+   */
+  dispose: 'none' | 'background'
+}
+
+/**
+ * Decoded animation, with the canvas geometry, loop count, and an
+ * ordered list of frames.
+ */
+export interface WebpAnimation {
+  /** Canvas width (pixels). */
+  width: number
+  /** Canvas height (pixels). */
+  height: number
+  /**
+   * Number of times to loop the animation. 0 = infinite, the default
+   * for most content. Other values mean play exactly N times.
+   */
+  loopCount: number
+  /** Background ARGB colour as a packed `(A << 24) | (R << 16) | (G << 8) | B`. */
+  backgroundColor: number
+  /** Animation frames in display order. */
+  frames: WebpAnimationFrame[]
+}

@@ -1,14 +1,17 @@
+export { decodeAnimation } from './animation'
 export { decode } from './decoder'
 export { encode, encodeWithAlpha } from './encoder'
-export { parseRiff, getWebpInfo, createRiffContainer } from './riff'
+export { createRiffContainer, getWebpInfo, parseRiff } from './riff'
 export type {
-  WebpImageData,
-  WebpEncodeOptions,
-  WebpDecodeOptions,
-  WebpInfo,
   RiffChunk,
   VP8FrameHeader,
   VP8LHeader,
+  WebpAnimation,
+  WebpAnimationFrame,
+  WebpDecodeOptions,
+  WebpEncodeOptions,
+  WebpImageData,
+  WebpInfo,
 } from './types'
 
 // Default export
