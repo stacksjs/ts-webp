@@ -12,27 +12,27 @@
 /** Stride between rows in the per-macroblock YUV buffer. */
 export const BPS = 32
 
-// Mode constants — libwebp keeps separate "no-top", "no-left",
-// "no-top-left" variants of 16×16/chroma DC for the missing-neighbour
-// edge cases.
-export const DC_PRED = 0
-export const V_PRED = 1
-export const H_PRED = 2
-export const TM_PRED = 3
-export const B_PRED = 4
+// Mode constants — aligned with libwebp's enum (16×16 modes alias
+// onto the corresponding B-mode values).
+export const DC_PRED = 0 // = B_DC
+export const V_PRED = 2 // = B_VE
+export const H_PRED = 3 // = B_HE
+export const TM_PRED = 1 // = B_TM
+export const B_PRED = 10 // = NUM_BMODES
+// Edge-variant DC predictors used when neighbours are missing.
 export const B_DC_PRED_NOTOP = 4
 export const B_DC_PRED_NOLEFT = 5
 export const B_DC_PRED_NOTOPLEFT = 6
 export const NUM_B_DC_MODES = 7
 
-// 4×4 B-modes
+// 4×4 B-modes — libwebp ordering (B_RD=4, B_VR=5, B_LD=6, NOT RFC 6386's LD=4/RD=5/VR=6).
 export const B_DC = 0
 export const B_TM = 1
 export const B_VE = 2
 export const B_HE = 3
-export const B_LD = 4
-export const B_RD = 5
-export const B_VR = 6
+export const B_RD = 4
+export const B_VR = 5
+export const B_LD = 6
 export const B_VL = 7
 export const B_HD = 8
 export const B_HU = 9

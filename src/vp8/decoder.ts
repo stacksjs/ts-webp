@@ -119,10 +119,16 @@ export function decodeVP8(data: Uint8Array): WebpImageData {
       nonZeroDc: 0,
     })
   }
+  // mbInfo[mbX].nz = bottom/top flags of MB at column mbX, stored for use
+  // as the "above" context when the NEXT MB row processes the same column.
+  // The "left" context is held in a separate sentinel that's reset at the
+  // start of each MB row and updated by each MB's processing — this mirrors
+  // libwebp's `dec->mb_info[-1]` sentinel.
   const mbInfo: MB[] = []
-  for (let i = 0; i < mbW + 1; i++) {
+  for (let i = 0; i < mbW; i++) {
     mbInfo.push({ nz: 0, nzDc: 0 })
   }
+  const leftMbSentinel: MB = { nz: 0, nzDc: 0 }
 
   // ── Set up token partitions ─────────────────────────────────────────────
   const tokenPartitions = parseTokenPartitions(data, header.partitionsOffset, header.numPartitions)
@@ -157,8 +163,8 @@ export function decodeVP8(data: Uint8Array): WebpImageData {
   for (let mbY = 0; mbY < mbH; mbY++) {
     // Reset left-MB tracker for this row.
     intraL.fill(B_DC_PRED)
-    mbInfo[0].nz = 0
-    mbInfo[0].nzDc = 0
+    leftMbSentinel.nz = 0
+    leftMbSentinel.nzDc = 0
 
     // Pass 1: parse mode info for every MB in this row.
     for (let mbX = 0; mbX < mbW; mbX++) {
@@ -172,7 +178,7 @@ export function decodeVP8(data: Uint8Array): WebpImageData {
     const tokenBR = tokenPartitions[mbY % header.numPartitions]
     for (let mbX = 0; mbX < mbW; mbX++) {
       decodeMB(
-        tokenBR, mbData[mbX], mbInfo[mbX], mbInfo[mbX + 1],
+        tokenBR, mbData[mbX], leftMbSentinel, mbInfo[mbX],
         useSkipProba, header.coefProbs, header.quant,
       )
     }
@@ -334,8 +340,11 @@ function decodeMB(
   }
   block.nonZeroY = nonZeroY
   block.nonZeroUV = nonZeroUV
-  mb.nz = outTNz
-  leftMb.nz = outLNz
+  // Truncate to 8 bits — libwebp stores `mb->nz` as uint8_t, so bits 8+
+  // (which can come from V's `<< 6` chroma packing) are silently lost.
+  // Both encoder and decoder must treat them as zero for context tracking.
+  mb.nz = outTNz & 0xFF
+  leftMb.nz = outLNz & 0xFF
 }
 
 // ---------------------------------------------------------------------------
@@ -611,22 +620,155 @@ function vp8YUVToB(y: number, u: number): number {
   return vp8Clip8(multHi(y, 19077) + multHi(u, 33050) - 17685)
 }
 
+/**
+ * Emit one luma pixel as RGBA at `out[oOff..oOff+3]` using YUV→RGB
+ * conversion. Inlined helper for the upsampler.
+ */
+function emitRgba(yi: number, ui: number, vi: number, out: Uint8Array, oOff: number): void {
+  out[oOff] = vp8YUVToR(yi, vi)
+  out[oOff + 1] = vp8YUVToG(yi, ui, vi)
+  out[oOff + 2] = vp8YUVToB(yi, ui)
+  out[oOff + 3] = 255
+}
+
+/**
+ * Fancy chroma upsampling — 1:1 port of libwebp's `UpsampleRgbaLinePair_C`
+ * macro (src/dsp/upsampling.c). For a pair of luma rows, this interpolates
+ * the corresponding two chroma rows so each output pixel gets a 4-tap
+ * weighted blend of nearby chroma samples (instead of nearest-neighbour
+ * replication). dwebp uses this by default; passing `-nofancy` falls back
+ * to nearest-neighbour. We always use fancy upsampling for bit-exact
+ * agreement with default `dwebp`.
+ */
+function upsampleLinePair(
+  topY: Uint8Array, topYOff: number,
+  botY: Uint8Array | null, botYOff: number,
+  topU: Uint8Array, topUOff: number, topV: Uint8Array, topVOff: number,
+  curU: Uint8Array, curUOff: number, curV: Uint8Array, curVOff: number,
+  topDst: Uint8Array, topDstOff: number,
+  botDst: Uint8Array | null, botDstOff: number,
+  len: number,
+): void {
+  // 4-channel (RGBA) output stride.
+  const STEP = 4
+  const lastPixelPair = (len - 1) >> 1
+  let tlU = topU[topUOff + 0]
+  let tlV = topV[topVOff + 0]
+  let lU = curU[curUOff + 0]
+  let lV = curV[curVOff + 0]
+
+  // x = 0 — use 3:1 weighted average between top-left and current-left.
+  {
+    const u0 = (3 * tlU + lU + 2) >> 2
+    const v0 = (3 * tlV + lV + 2) >> 2
+    emitRgba(topY[topYOff + 0], u0, v0, topDst, topDstOff + 0)
+  }
+  if (botY !== null && botDst !== null) {
+    const u0 = (3 * lU + tlU + 2) >> 2
+    const v0 = (3 * lV + tlV + 2) >> 2
+    emitRgba(botY[botYOff + 0], u0, v0, botDst, botDstOff + 0)
+  }
+
+  for (let x = 1; x <= lastPixelPair; x++) {
+    const tU = topU[topUOff + x]
+    const tV = topV[topVOff + x]
+    const cU = curU[curUOff + x]
+    const cV = curV[curVOff + x]
+    // Pre-compute diagonal averages.
+    const avgU = tlU + tU + lU + cU + 8
+    const avgV = tlV + tV + lV + cV + 8
+    const diag12U = (avgU + 2 * (tU + lU)) >> 3
+    const diag12V = (avgV + 2 * (tV + lV)) >> 3
+    const diag03U = (avgU + 2 * (tlU + cU)) >> 3
+    const diag03V = (avgV + 2 * (tlV + cV)) >> 3
+    {
+      const u0 = (diag12U + tlU) >> 1
+      const v0 = (diag12V + tlV) >> 1
+      const u1 = (diag03U + tU) >> 1
+      const v1 = (diag03V + tV) >> 1
+      emitRgba(topY[topYOff + 2 * x - 1], u0, v0, topDst, topDstOff + (2 * x - 1) * STEP)
+      emitRgba(topY[topYOff + 2 * x - 0], u1, v1, topDst, topDstOff + (2 * x - 0) * STEP)
+    }
+    if (botY !== null && botDst !== null) {
+      const u0 = (diag03U + lU) >> 1
+      const v0 = (diag03V + lV) >> 1
+      const u1 = (diag12U + cU) >> 1
+      const v1 = (diag12V + cV) >> 1
+      emitRgba(botY[botYOff + 2 * x - 1], u0, v0, botDst, botDstOff + (2 * x - 1) * STEP)
+      emitRgba(botY[botYOff + 2 * x + 0], u1, v1, botDst, botDstOff + (2 * x + 0) * STEP)
+    }
+    tlU = tU
+    tlV = tV
+    lU = cU
+    lV = cV
+  }
+  if ((len & 1) === 0) {
+    {
+      const u0 = (3 * tlU + lU + 2) >> 2
+      const v0 = (3 * tlV + lV + 2) >> 2
+      emitRgba(topY[topYOff + len - 1], u0, v0, topDst, topDstOff + (len - 1) * STEP)
+    }
+    if (botY !== null && botDst !== null) {
+      const u0 = (3 * lU + tlU + 2) >> 2
+      const v0 = (3 * lV + tlV + 2) >> 2
+      emitRgba(botY[botYOff + len - 1], u0, v0, botDst, botDstOff + (len - 1) * STEP)
+    }
+  }
+}
+
 function yuv420ToRgba(
   Y: Uint8Array, U: Uint8Array, V: Uint8Array,
   yStride: number, uvStride: number,
   W: number, H: number, out: Uint8Array,
 ): void {
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const yi = Y[y * yStride + x]
-      const ui = U[(y >> 1) * uvStride + (x >> 1)]
-      const vi = V[(y >> 1) * uvStride + (x >> 1)]
-      const o = (y * W + x) * 4
-      out[o] = vp8YUVToR(yi, vi)
-      out[o + 1] = vp8YUVToG(yi, ui, vi)
-      out[o + 2] = vp8YUVToB(yi, ui)
-      out[o + 3] = 255
-    }
+  // dwebp defaults to fancy chroma upsampling — replicate that for bit-
+  // exact agreement.
+  const outStride = W * 4
+
+  // Row 0 — first row, mirror chroma at boundary (top_u = cur_u).
+  upsampleLinePair(
+    Y, 0, null, 0,
+    U, 0, V, 0,
+    U, 0, V, 0,
+    out, 0,
+    null, 0,
+    W,
+  )
+
+  // Pairs of luma rows starting from (1, 2).
+  for (let y = 0; y + 4 <= H + 2; y += 2) {
+    // libwebp's loop body: top_u/v advance to previous cur_u/v, cur_u/v
+    // advance by uv_stride; cur_y advances by 2*y_stride; emit at
+    // (dst - stride, dst).
+    if (y >= H - 2) break
+    const topUVRow = y >> 1 // chroma row that "covers" luma rows y and y+1
+    const curUVRow = topUVRow + 1
+    if (curUVRow >= H >> 1) break
+    const topYRow = y + 1
+    const botYRow = y + 2
+    upsampleLinePair(
+      Y, topYRow * yStride,
+      Y, botYRow * yStride,
+      U, topUVRow * uvStride, V, topUVRow * uvStride,
+      U, curUVRow * uvStride, V, curUVRow * uvStride,
+      out, topYRow * outStride,
+      out, botYRow * outStride,
+      W,
+    )
+  }
+
+  // Last row (only if H is even; matches libwebp's `if (!(y_end & 1))`).
+  if ((H & 1) === 0) {
+    const lastRow = H - 1
+    const lastChroma = (H >> 1) - 1
+    upsampleLinePair(
+      Y, lastRow * yStride, null, 0,
+      U, lastChroma * uvStride, V, lastChroma * uvStride,
+      U, lastChroma * uvStride, V, lastChroma * uvStride,
+      out, lastRow * outStride,
+      null, 0,
+      W,
+    )
   }
 }
 

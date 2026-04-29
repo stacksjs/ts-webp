@@ -64,28 +64,63 @@ describe('VP8 lossy decode — fixture round-trip', () => {
     return { width: w, height: h, data: buf.slice(i) }
   }
 
-  it('decodes a multi-partition image with segmentation + LF deltas', () => {
-    // grad-large is a 256×192 colour gradient encoded at q=50, which
-    // triggers cwebp to emit per-segment quantiser and filter overrides,
-    // and (because of the larger size) multiple token partitions.
-    const fix = readFileSync(join(import.meta.dir, 'fixtures/grad-large-q50.webp'))
-    const refRaw = readFileSync(join(import.meta.dir, 'fixtures/grad-large-q50-ref.ppm'))
-    const ref = readPpm(new Uint8Array(refRaw))
+  for (const q of [30, 75, 95]) {
+    it(`decodes a 384×288 photo-like fixture at q=${q} bit-exact`, () => {
+      // Photo-like content with low-frequency colour and high-frequency texture.
+      // At these resolutions cwebp emits multiple token partitions and all
+      // 4 segments with different quantiser/filter strength.
+      const fix = readFileSync(join(import.meta.dir, `fixtures/photo-q${q}.webp`))
+      const refRaw = readFileSync(join(import.meta.dir, `fixtures/photo-q${q}-ref.ppm`))
+      const ref = readPpm(new Uint8Array(refRaw))
+      const out = decode(new Uint8Array(fix))
+      expect(out.width).toBe(ref.width)
+      expect(out.height).toBe(ref.height)
+      let max = 0
+      for (let p = 0; p < ref.width * ref.height; p++) {
+        for (let c = 0; c < 3; c++) {
+          const d = Math.abs(out.data[p * 4 + c] - ref.data[p * 3 + c])
+          if (d > max) max = d
+        }
+      }
+      expect(max).toBe(0)
+    })
+  }
+
+  for (const q of [30, 50, 75, 90]) {
+    it(`decodes a 256×192 multi-segment fixture at q=${q} bit-exact`, () => {
+      // grad-large at q=30/50/75/90 — exercises segmentation, multi-MB
+      // context tracking, and a wide range of quantisers. cwebp emits
+      // per-segment quantiser and filter overrides for these.
+      const fix = readFileSync(join(import.meta.dir, `fixtures/grad-large-q${q}.webp`))
+      const refRaw = readFileSync(join(import.meta.dir, `fixtures/grad-large-q${q}-ref.ppm`))
+      const ref = readPpm(new Uint8Array(refRaw))
+      const out = decode(new Uint8Array(fix))
+      expect(out.width).toBe(ref.width)
+      expect(out.height).toBe(ref.height)
+      let max = 0
+      for (let p = 0; p < ref.width * ref.height; p++) {
+        for (let c = 0; c < 3; c++) {
+          const d = Math.abs(out.data[p * 4 + c] - ref.data[p * 3 + c])
+          if (d > max) max = d
+        }
+      }
+      expect(max).toBe(0)
+    })
+  }
+
+  it('matches dwebp bit-exact', () => {
+    const fix = readFileSync(join(import.meta.dir, 'fixtures/lossy-q75.webp'))
+    const refRaw = readFileSync(join(import.meta.dir, 'fixtures/reference-q75.pam'))
+    const ref = readPam(new Uint8Array(refRaw))
     const out = decode(new Uint8Array(fix))
     expect(out.width).toBe(ref.width)
     expect(out.height).toBe(ref.height)
-    let total = 0
     let max = 0
-    for (let p = 0; p < ref.width * ref.height; p++) {
-      for (let c = 0; c < 3; c++) {
-        const d = Math.abs(out.data[p * 4 + c] - ref.data[p * 3 + c])
-        total += d
-        if (d > max) max = d
-      }
+    for (let i = 0; i < out.data.length; i++) {
+      const d = Math.abs(out.data[i] - ref.data[i])
+      if (d > max) max = d
     }
-    const mean = total / (ref.width * ref.height * 3)
-    // eslint-disable-next-line no-console
-    console.log(`grad-large fixture: mean=${mean.toFixed(2)}, max=${max} (target: 0/0)`)
+    expect(max).toBe(0)
   })
 
   it('produces RGBA output of the correct dimensions', () => {

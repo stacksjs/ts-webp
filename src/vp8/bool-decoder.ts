@@ -31,6 +31,7 @@ function bitsLog2Floor(n: number): number {
   return log
 }
 
+
 export class BoolDecoder {
   private readonly buf: Uint8Array
   private bufPos: number
@@ -108,6 +109,35 @@ export class BoolDecoder {
     }
     this.rangeM1 = newRange - 1
     return bit
+  }
+
+  /**
+   * Decode a uniform sign bit and return ±v. Mirrors libwebp's
+   * `VP8GetSigned` exactly — note this is NOT functionally equivalent
+   * to `readBit(0x80) ? -v : v` because libwebp's signed-bit reader
+   * uses a shorter state-advance path (no explicit renormalisation
+   * shift) that leaves the bool-decoder state in a slightly different
+   * place. Bit-exact agreement with `dwebp` requires using this
+   * variant for sign bits, since libwebp's encoder side-channels the
+   * sign through the same path.
+   */
+  readSigned(v: number): number {
+    if (this.bitsLeft < 0) this.loadFinalBytes()
+    const pos = this.bitsLeft
+    const range = this.rangeM1
+    const split = range >>> 1
+    const value = Math.floor(this.value / 2 ** pos)
+    // mask = (split - value) >> 31 = -1 if value > split, else 0.
+    const mask = value > split ? -1 : 0
+    this.bitsLeft -= 1
+    // libwebp: br->range += mask; br->range |= 1 (force odd).
+    let newRange = range + mask
+    newRange |= 1
+    if (mask !== 0) {
+      this.value -= (split + 1) * 2 ** pos
+    }
+    this.rangeM1 = newRange
+    return mask !== 0 ? -v : v
   }
 
   /** Decode a flat (uniform-probability) `bits`-wide unsigned integer. */

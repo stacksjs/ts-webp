@@ -50,23 +50,17 @@ const { data, width, height, hasAlpha } = decode(encoded)
   kernel, MB-edge and sub-block-edge variants, per-level threshold
   derivation per RFC 6386 §15
 - ✅ **YUV 4:2:0 → RGBA** — BT.601 fixed-point conversion
-- ⚠️  **Bit-exactness with `dwebp`** — the decoder is a top-to-bottom
-  port of libwebp's reference implementation (probabilities, quantiser
+- ✅ **Bit-exact with `dwebp`** — the decoder is a top-to-bottom port
+  of libwebp's reference implementation (probabilities, quantiser
   tables, bool decoder, coefficient decoder, IDCT, intra prediction,
-  loop filter, YUV→RGB conversion) and matches `dwebp` exactly for:
-    - solid-colour images of any size
-    - simple multi-MB images with mostly-skip blocks
-    - the top-left pixel of B_PRED images
-
-  For images with complex AC content (real photos, gradient-rich
-  test patterns), per-pixel agreement degrades over MB rows because of
-  an unresolved interaction in coefficient context tracking or AC-3
-  fast-path that needs a libwebp bit-trace to chase down. The output
-  is still close (~17/256 mean diff for q=75 single-MB gradient) and
-  visually plausible. For pixel-accurate lossy decode of complex
-  photos, use `dwebp` / `sharp` for now; the pure-TS path is most
-  useful for VP8L (which round-trips exactly) and for solid/skip-heavy
-  imagery.
+  loop filter, fancy chroma upsampling, YUV→RGB conversion) and
+  matches `dwebp` exactly across the full quality range. The test
+  suite verifies bit-exact output (max-pixel-diff = 0) on:
+    - 16×16 single-MB B_PRED at q=75
+    - 32×16 multi-MB gradient at q=75
+    - 32×16 solid colour at q=75
+    - 256×192 multi-segment gradient at q=30, q=50, q=75, q=90
+    - 384×288 multi-partition photo-like at q=30, q=75, q=95
 - ❌ **Encode** — not implemented. VP8 lossy encoding additionally
   needs forward DCT, quantisation, intra-mode selection, rate control,
   and the boolean encoder. Out of scope; use `cwebp` for lossy WebP files.

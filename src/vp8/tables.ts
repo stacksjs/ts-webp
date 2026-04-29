@@ -495,21 +495,33 @@ export function clampQi(qi: number): number {
 // Mode constants (libwebp `vp8i_dec.h`)
 // ---------------------------------------------------------------------------
 
-/** Luma 16×16 prediction modes. */
-export const DC_PRED = 0
-export const V_PRED = 1
-export const H_PRED = 2
-export const TM_PRED = 3
-export const B_PRED = 4
+/**
+ * Luma 16×16 prediction modes. libwebp aliases these onto the 4×4
+ * B-mode enum values (DC=B_DC, V=B_VE, H=B_HE, TM=B_TM) so that when
+ * a non-B_PRED MB writes its ymode into the intra_t/intra_l B-mode
+ * tracker, the value propagates correctly into the next MB's
+ * `kBModesProba` lookup.
+ */
+export const DC_PRED = 0 // = B_DC_PRED
+export const V_PRED = 2 // = B_VE_PRED
+export const H_PRED = 3 // = B_HE_PRED
+export const TM_PRED = 1 // = B_TM_PRED
+export const B_PRED = 10 // = NUM_BMODES
 
-/** Per-4×4 luma intra modes. */
+/**
+ * Per-4×4 luma intra modes. libwebp's enum has B_RD/B_VR/B_LD at
+ * positions 4/5/6 (NOT the RFC 6386 / libvpx ordering of LD/RD/VR).
+ * This matters because the bit-tree decodes mode indices that get
+ * stored in `intra_t`/`intra_l` and used to index `kBModesProba`,
+ * so the value MUST match libwebp's convention to be bit-exact.
+ */
 export const B_DC_PRED = 0
 export const B_TM_PRED = 1
 export const B_VE_PRED = 2
 export const B_HE_PRED = 3
-export const B_LD_PRED = 4
-export const B_RD_PRED = 5
-export const B_VR_PRED = 6
+export const B_RD_PRED = 4
+export const B_VR_PRED = 5
+export const B_LD_PRED = 6
 export const B_VL_PRED = 7
 export const B_HD_PRED = 8
 export const B_HU_PRED = 9

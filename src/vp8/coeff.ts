@@ -119,9 +119,10 @@ export function decodeBlockCoeffs(
       v = getLargeValue(br, p)
       nextCtx = 2
     }
-    const sign = br.readBit(0x80)
+    // libwebp's coef sign uses VP8GetSigned (different state-advance
+    // path than VP8GetBit(0x80)). Must match for bit-exact agreement.
     const dq = n > 0 ? dqAc : dqDc
-    out[ZIGZAG[n]] = (sign ? -v : v) * dq
+    out[ZIGZAG[n]] = br.readSigned(v) * dq
     // Pre-fetch next position's probs at the chosen context.
     if (n + 1 < 16) {
       p = probSlice(probs, blockType, COEF_BANDS[n + 1], nextCtx)
