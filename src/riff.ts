@@ -1,50 +1,58 @@
 import type { RiffChunk, WebpInfo } from './types'
 
 /**
- * Parse RIFF container
+ * Parse a RIFF/WEBP container into its constituent chunks.
+ *
+ * Each chunk's `data` is a `subarray` view into the input buffer — no
+ * copy. This matters for large WebP files: the previous implementation
+ * used `buffer.slice(...)` which copied each chunk's bytes, doubling
+ * peak memory during decode of multi-megabyte input. Callers that
+ * mutate chunk data should clone explicitly.
+ *
+ * Tolerates short/truncated input: instead of looping to negative
+ * offsets or reading past EOF, we stop cleanly when the next chunk
+ * header would extend beyond `buffer.length`.
  */
 export function parseRiff(buffer: Uint8Array): RiffChunk[] {
-  const chunks: RiffChunk[] = []
+  if (buffer.length < 12) {
+    throw new Error('Invalid RIFF file: shorter than 12-byte container header')
+  }
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
 
-  // Check RIFF signature
-  const riff = String.fromCharCode(buffer[0], buffer[1], buffer[2], buffer[3])
-  if (riff !== 'RIFF') {
+  if (buffer[0] !== 0x52 || buffer[1] !== 0x49 || buffer[2] !== 0x46 || buffer[3] !== 0x46) {
     throw new Error('Invalid RIFF file: missing RIFF signature')
   }
-
-  // Check WEBP signature
-  const webp = String.fromCharCode(buffer[8], buffer[9], buffer[10], buffer[11])
-  if (webp !== 'WEBP') {
+  if (buffer[8] !== 0x57 || buffer[9] !== 0x45 || buffer[10] !== 0x42 || buffer[11] !== 0x50) {
     throw new Error('Invalid WebP file: missing WEBP signature')
   }
 
-  // Parse chunks
+  const chunks: RiffChunk[] = []
   let offset = 12
-
-  while (offset < buffer.length - 8) {
+  while (offset + 8 <= buffer.length) {
     const fourCC = String.fromCharCode(
       buffer[offset],
       buffer[offset + 1],
       buffer[offset + 2],
       buffer[offset + 3],
     )
-
     const size = view.getUint32(offset + 4, true)
-
-    // Pad to even boundary
-    const paddedSize = size + (size & 1)
-
+    // A claimed size larger than the remaining buffer is malformed —
+    // clamp to what's available so the caller still gets a usable
+    // (truncated) view rather than walking off the end.
+    const dataStart = offset + 8
+    const dataEnd = Math.min(dataStart + size, buffer.length)
     chunks.push({
       fourCC,
       size,
-      data: buffer.slice(offset + 8, offset + 8 + size),
-      offset: offset + 8,
+      data: buffer.subarray(dataStart, dataEnd),
+      offset: dataStart,
     })
-
-    offset += 8 + paddedSize
+    // Pad to even boundary, but never advance past EOF.
+    const paddedSize = size + (size & 1)
+    const nextOffset = offset + 8 + paddedSize
+    if (nextOffset <= offset) break // defensively guard against overflow
+    offset = nextOffset
   }
-
   return chunks
 }
 

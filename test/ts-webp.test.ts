@@ -219,4 +219,38 @@ describe('ts-webp', () => {
       expect(typeof webp.decode).toBe('function')
     })
   })
+
+  describe('decode format option', () => {
+    it('format: "rgba" (default) returns 4 bytes per pixel', () => {
+      const img = makeImage(4, 3, (x, y) => [x * 50, y * 50, 100, 200])
+      const decoded = decode(encode(img))
+      expect(decoded.data.length).toBe(4 * 3 * 4)
+    })
+
+    it('format: "rgb" returns 3 bytes per pixel and drops alpha', () => {
+      const img = makeImage(4, 3, (x, y) => [x * 50, y * 50, 100, 200])
+      const decoded = decode(encode(img), { format: 'rgb' })
+      expect(decoded.data.length).toBe(4 * 3 * 3)
+      // First pixel: x=0, y=0 → r=0, g=0, b=100. Verify no alpha byte was
+      // copied into the RGB stream.
+      expect(decoded.data[0]).toBe(0)
+      expect(decoded.data[1]).toBe(0)
+      expect(decoded.data[2]).toBe(100)
+      // Second pixel starts at offset 3 (not 4) — that's the whole point
+      // of `rgb`: stride is 3, not 4.
+      expect(decoded.data[3]).toBe(50) // x=1's red
+    })
+
+    it('format: "rgb" preserves R/G/B byte-for-byte across all pixels', () => {
+      const img = makeImage(8, 8, (x, y) => [x * 16, y * 16, (x + y) * 8, 255])
+      const decoded = decode(encode(img), { format: 'rgb' })
+      for (let p = 0; p < 64; p++) {
+        const x = p % 8
+        const y = (p / 8) | 0
+        expect(decoded.data[p * 3]).toBe(x * 16)
+        expect(decoded.data[p * 3 + 1]).toBe(y * 16)
+        expect(decoded.data[p * 3 + 2]).toBe((x + y) * 8)
+      }
+    })
+  })
 })

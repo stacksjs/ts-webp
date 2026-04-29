@@ -40,6 +40,15 @@ const TRANSFORM_COLOR = 1
 const TRANSFORM_SUBTRACT_GREEN = 2
 const TRANSFORM_COLOR_INDEXING = 3
 
+/** A Huffman group is the 5-tree set used for one block of the image. */
+interface HuffmanGroup {
+  green: HuffmanTree
+  red: HuffmanTree
+  blue: HuffmanTree
+  alpha: HuffmanTree
+  distance: HuffmanTree
+}
+
 /** Recorded transform with any payload it needs at inverse-apply time. */
 interface TransformRecord {
   type: number
@@ -152,33 +161,73 @@ function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
   const colorCacheSize = colorCacheBits > 0 ? 1 << colorCacheBits : 0
   const colorCache = colorCacheSize > 0 ? new Uint32Array(colorCacheSize) : null
 
-  // ── Meta-Huffman flag ──
+  // ── Meta-Huffman image ──
+  // Real-world libwebp output at quality > 75 uses multiple Huffman
+  // groups, with the per-pixel choice driven by a meta-image (one
+  // pixel per `2^bits × 2^bits` source block). We support this end-to-end
+  // on decode; our encoder always uses a single group.
+  let metaHuffmanBits = 0
+  let metaHuffmanImage: Uint32Array | null = null
+  let metaHuffmanWidth = 0
+  let numHuffmanGroups = 1
   if (reader.readBit() === 1) {
-    throw new Error('VP8L meta-Huffman images not yet supported')
+    metaHuffmanBits = reader.readBits(3) + 2
+    metaHuffmanWidth = (effectiveWidth + (1 << metaHuffmanBits) - 1) >>> metaHuffmanBits
+    const metaH = (header.height + (1 << metaHuffmanBits) - 1) >>> metaHuffmanBits
+    metaHuffmanImage = readSubImage(reader, metaHuffmanWidth, metaH)
+    // Group index lives in (red << 8) | green of each meta pixel; find max.
+    let maxGroup = 0
+    for (let i = 0; i < metaHuffmanImage.length; i++) {
+      const px = metaHuffmanImage[i]
+      const idx = ((px >>> 16) & 0xFF) * 256 + ((px >>> 8) & 0xFF)
+      if (idx > maxGroup) maxGroup = idx
+    }
+    numHuffmanGroups = maxGroup + 1
   }
 
-  // ── 5 Huffman trees ──
+  // ── 5 trees per group ──
   const numLiteralCodes = NUM_LITERAL_CODES + NUM_LENGTH_CODES + colorCacheSize
-  const greenTree = readHuffmanTree(reader, numLiteralCodes)
-  const redTree = readHuffmanTree(reader, 256)
-  const blueTree = readHuffmanTree(reader, 256)
-  const alphaTree = readHuffmanTree(reader, 256)
-  const distTree = readHuffmanTree(reader, NUM_DISTANCE_CODES)
+  const groups: HuffmanGroup[] = []
+  for (let g = 0; g < numHuffmanGroups; g++) {
+    groups.push({
+      green: readHuffmanTree(reader, numLiteralCodes),
+      red: readHuffmanTree(reader, 256),
+      blue: readHuffmanTree(reader, 256),
+      alpha: readHuffmanTree(reader, 256),
+      distance: readHuffmanTree(reader, NUM_DISTANCE_CODES),
+    })
+  }
 
   // ── Decode pixels ──
   // The pixel stream is sized at `effectiveWidth × header.height` — color-
   // indexing may have shrunk the working width below the original.
-  let argb = decodePixelStream(
-    reader,
-    greenTree,
-    redTree,
-    blueTree,
-    alphaTree,
-    distTree,
-    effectiveWidth * header.height,
-    colorCacheBits,
-    colorCache,
-  )
+  let argb: Uint32Array
+  if (metaHuffmanImage) {
+    argb = decodePixelStreamMeta(
+      reader,
+      groups,
+      effectiveWidth,
+      header.height,
+      metaHuffmanBits,
+      metaHuffmanImage,
+      metaHuffmanWidth,
+      colorCacheBits,
+      colorCache,
+    )
+  } else {
+    const g = groups[0]
+    argb = decodePixelStream(
+      reader,
+      g.green,
+      g.red,
+      g.blue,
+      g.alpha,
+      g.distance,
+      effectiveWidth * header.height,
+      colorCacheBits,
+      colorCache,
+    )
+  }
 
   // ── Apply transform inverses in REVERSE bitstream order ──
   // Spec: transforms appear in the bitstream in their forward-application
@@ -297,6 +346,89 @@ function decodePixelStream(
       const lengthCode = code - NUM_LITERAL_CODES
       const length = lengthFromCode(lengthCode, reader.readBits(LENGTH_EXTRA_BITS[lengthCode]))
       const distanceCode = distTree.readSymbol(reader)
+      const distance = distanceFromCode(distanceCode, reader.readBits(DISTANCE_EXTRA_BITS[distanceCode]))
+      const start = pos - distance
+      if (start < 0) throw new Error(`VP8L: backreference distance ${distance} > position ${pos}`)
+      const end = Math.min(pos + length, numPixels)
+      for (let p = pos; p < end; p++) {
+        const px = argb[p - distance]
+        argb[p] = px
+        if (colorCache) {
+          const slot = (Math.imul(px, VP8L_HASH_MUL) >>> (32 - colorCacheBits)) & (colorCacheSize - 1)
+          colorCache[slot] = px
+        }
+      }
+      pos = end
+    } else {
+      if (!colorCache) throw new Error('VP8L: color-cache code with no cache')
+      const cacheIndex = code - NUM_LITERAL_CODES - NUM_LENGTH_CODES
+      if (cacheIndex >= colorCacheSize) throw new Error(`VP8L: color-cache index ${cacheIndex} out of range`)
+      argb[pos++] = colorCache[cacheIndex]
+    }
+  }
+
+  return argb
+}
+
+/**
+ * Decode a prefix-coded pixel stream that uses a meta-Huffman image:
+ * each `2^bits × 2^bits` block of the image picks one of `groups[]` to
+ * read the next pixels. Otherwise identical to `decodePixelStream`.
+ *
+ * Group switches happen at *block boundaries*, but a backreference can
+ * span blocks — when it does, the group in effect for the rest of the
+ * backref is whatever was active when the run started. Cache updates
+ * touch every reproduced pixel regardless of group.
+ */
+function decodePixelStreamMeta(
+  reader: BitReader,
+  groups: HuffmanGroup[],
+  width: number,
+  height: number,
+  metaBits: number,
+  metaImage: Uint32Array,
+  metaWidth: number,
+  colorCacheBits: number,
+  colorCache: Uint32Array | null,
+): Uint32Array {
+  const colorCacheSize = colorCache ? colorCache.length : 0
+  const numPixels = width * height
+  const argb = new Uint32Array(numPixels)
+  let pos = 0
+  let lastGroupX = -1
+  let lastGroupY = -1
+  let group = groups[0]
+
+  while (pos < numPixels) {
+    const x = pos % width
+    const y = (pos / width) | 0
+    const bx = x >>> metaBits
+    const by = y >>> metaBits
+    if (bx !== lastGroupX || by !== lastGroupY) {
+      lastGroupX = bx
+      lastGroupY = by
+      const meta = metaImage[by * metaWidth + bx]
+      const gIdx = ((meta >>> 16) & 0xFF) * 256 + ((meta >>> 8) & 0xFF)
+      if (gIdx >= groups.length) throw new Error(`VP8L: meta-Huffman group index ${gIdx} out of range`)
+      group = groups[gIdx]
+    }
+
+    const code = group.green.readSymbol(reader)
+    if (code < NUM_LITERAL_CODES) {
+      const green = code
+      const red = group.red.readSymbol(reader)
+      const blue = group.blue.readSymbol(reader)
+      const alpha = group.alpha.readSymbol(reader)
+      const pixel = ((alpha & 0xFF) << 24) | ((red & 0xFF) << 16) | ((green & 0xFF) << 8) | (blue & 0xFF)
+      argb[pos++] = pixel
+      if (colorCache) {
+        const slot = (Math.imul(pixel, VP8L_HASH_MUL) >>> (32 - colorCacheBits)) & (colorCacheSize - 1)
+        colorCache[slot] = pixel
+      }
+    } else if (code < NUM_LITERAL_CODES + NUM_LENGTH_CODES) {
+      const lengthCode = code - NUM_LITERAL_CODES
+      const length = lengthFromCode(lengthCode, reader.readBits(LENGTH_EXTRA_BITS[lengthCode]))
+      const distanceCode = group.distance.readSymbol(reader)
       const distance = distanceFromCode(distanceCode, reader.readBits(DISTANCE_EXTRA_BITS[distanceCode]))
       const start = pos - distance
       if (start < 0) throw new Error(`VP8L: backreference distance ${distance} > position ${pos}`)
