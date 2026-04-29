@@ -48,7 +48,7 @@ const DEFAULT_CACHE_BITS = 11
 const VP8L_HASH_MUL = 0x1E35A7BD
 
 /** Token discriminator: literal pixel, LZ77 backreference, color-cache hit. */
-const enum TokenKind {
+enum TokenKind {
   Literal = 0,
   Backref = 1,
   Cache = 2,

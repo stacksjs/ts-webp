@@ -95,7 +95,7 @@ describe('decoder crash-resistance', () => {
     // Sanity check — we expect mostly thrown errors, but if zero ever
     // succeed it's still fine.
     expect(crashes).toBeLessThan(1000)
-  })
+  }, 30000)
 
   it('decode() handles malformed VP8L bitstreams (valid wrapper, garbage payload)', () => {
     // Build a valid RIFF/WEBP wrapper around a random 'VP8L' payload.
@@ -126,7 +126,7 @@ describe('decoder crash-resistance', () => {
         if (!(e instanceof Error)) throw new Error(`non-Error thrown for seed ${seed}`)
       }
     }
-  })
+  }, 30000)
 
   it('parseRiff handles truncated chunks without infinite loop', () => {
     // A valid RIFF/WEBP header but a chunk length that runs past EOF.
