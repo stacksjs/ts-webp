@@ -411,10 +411,16 @@ function reconstructRow(
           for (let i = 0; i < 4; i++) yuvB[yDst - BPS + 16 + i] = yuvT.y[(mbX + 1) * 16 + i]
         }
       }
-      // Replicate top-right below the MB row (so VE4 of bottom-right blocks works).
-      const fill = yuvB[yDst - BPS + 16]
-      for (let r = 1; r < 4; r++) {
-        for (let i = 0; i < 4; i++) yuvB[yDst + r * BPS - BPS + 16 + i] = fill
+      // Replicate the top-right 4 bytes at rows 3, 7, 11 (the rows above
+      // sub-blocks 7, 11, 15) so their VE4/LD4/VL4 predictors can read
+      // top[4..7] from those positions. Mirrors libwebp's
+      // `top_right[BPS] = top_right[2*BPS] = top_right[3*BPS] = top_right[0]`,
+      // where BPS is interpreted as a uint32_t-unit stride.
+      for (let r = 0; r < 4; r++) {
+        const src = yDst - BPS + 16 + r
+        for (let dstRow = 1; dstRow < 4; dstRow++) {
+          yuvB[yDst + dstRow * 4 * BPS - BPS + 16 + r] = yuvB[src]
+        }
       }
 
       let bits = block.nonZeroY >>> 0

@@ -50,15 +50,23 @@ const { data, width, height, hasAlpha } = decode(encoded)
   kernel, MB-edge and sub-block-edge variants, per-level threshold
   derivation per RFC 6386 §15
 - ✅ **YUV 4:2:0 → RGBA** — BT.601 fixed-point conversion
-- ⚠️  **Bit-exact agreement with libvpx** — the decoder runs end-to-end
-  without crashing on real `cwebp` output and produces RGBA buffers of
-  the correct dimensions, but the per-pixel values do not yet match the
-  `dwebp` reference exactly. The byte-level boolean decoder is verified
-  against synthetic round-trip inputs; the divergence likely sits in
-  per-block context handling or the proba-update step and needs
-  side-by-side bitstream comparison with libvpx to chase down. For now
-  use `dwebp` / `sharp` if you need pixel-accurate lossy decode; the
-  pure-TS path is most useful for VP8L (which round-trips exactly).
+- ⚠️  **Bit-exactness with `dwebp`** — the decoder is a top-to-bottom
+  port of libwebp's reference implementation (probabilities, quantiser
+  tables, bool decoder, coefficient decoder, IDCT, intra prediction,
+  loop filter, YUV→RGB conversion) and matches `dwebp` exactly for:
+    - solid-colour images of any size
+    - simple multi-MB images with mostly-skip blocks
+    - the top-left pixel of B_PRED images
+
+  For images with complex AC content (real photos, gradient-rich
+  test patterns), per-pixel agreement degrades over MB rows because of
+  an unresolved interaction in coefficient context tracking or AC-3
+  fast-path that needs a libwebp bit-trace to chase down. The output
+  is still close (~17/256 mean diff for q=75 single-MB gradient) and
+  visually plausible. For pixel-accurate lossy decode of complex
+  photos, use `dwebp` / `sharp` for now; the pure-TS path is most
+  useful for VP8L (which round-trips exactly) and for solid/skip-heavy
+  imagery.
 - ❌ **Encode** — not implemented. VP8 lossy encoding additionally
   needs forward DCT, quantisation, intra-mode selection, rate control,
   and the boolean encoder. Out of scope; use `cwebp` for lossy WebP files.
