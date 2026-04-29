@@ -1,10 +1,11 @@
 {
-  "name": "ts-webp",
+  "name": "@stacksjs/ts-webp",
+  "type": "module",
   "version": "0.1.0",
   "description": "A pure TypeScript WebP encoder and decoder with zero native dependencies",
   "author": "Chris Breuer <chris@stacksjs.org>",
   "license": "MIT",
-  "homepage": "https://github.com/stacksjs/ts-webp",
+  "homepage": "https://github.com/stacksjs/ts-webp#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/stacksjs/ts-webp.git"
@@ -22,7 +23,6 @@
     "typescript",
     "pure"
   ],
-  "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -40,20 +40,33 @@
   ],
   "scripts": {
     "build": "bun --bun build.ts",
+    "fresh": "bunx rimraf node_modules/ bun.lock && bun i",
+    "prepublishOnly": "bun --bun run build",
     "test": "bun test",
-    "lint": "eslint .",
-    "typecheck": "tsc --noEmit",
-    "prepublishOnly": "bun run build",
-    "changelog": "bunx logsmith --verbose",
-    "changelog:generate": "bunx logsmith --output CHANGELOG.md",
+    "lint": "bunx --bun pickier .",
+    "lint:fix": "bunx --bun pickier . --fix",
+    "format": "bunx --bun pickier . --format",
+    "format:fix": "bunx --bun pickier . --format --write",
+    "typecheck": "bun --bun tsc --noEmit",
+    "changelog": "bunx --bun logsmith --verbose",
+    "changelog:generate": "bunx --bun logsmith --output CHANGELOG.md",
     "release": "bun --bun run changelog:generate && bunx --bun bumpx prompt --recursive",
-    "release:patch": "bun --bun run changelog:generate && bunx --bun bumpx patch --yes",
-    "release:minor": "bun --bun run changelog:generate && bunx --bun bumpx minor --yes",
-    "release:major": "bun --bun run changelog:generate && bunx --bun bumpx major --yes"
+    "release:patch": "bun --bun run changelog:generate && bunx --bun bumpx patch --yes --recursive",
+    "release:minor": "bun --bun run changelog:generate && bunx --bun bumpx minor --yes --recursive",
+    "release:major": "bun --bun run changelog:generate && bunx --bun bumpx major --yes --recursive",
+    "postinstall": "bunx git-hooks"
   },
   "devDependencies": {
-    "@stacksjs/eslint-config": "^4.5.1",
-    "bun-plugin-dtsx": "^0.21.12",
-    "typescript": "^5.7.3"
+    "@types/bun": "latest",
+    "better-dx": "^0.2.7"
+  },
+  "git-hooks": {
+    "pre-commit": {
+      "stagedLint": {
+        "*.{js,ts,json,yaml,yml,md}": "bunx --bun pickier lint --fix"
+      },
+      "autoRestage": true
+    },
+    "commit-msg": "bunx gitlint --edit .git/COMMIT_EDITMSG"
   }
 }

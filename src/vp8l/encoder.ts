@@ -95,7 +95,7 @@ export function encodeVP8L(
   if (opts.subtractGreen) applySubtractGreen(argb)
 
   // ── Step 3: tokenize ──
-  const tokens = tokenize(argb, width, opts)
+  const tokens = tokenize(argb, opts)
 
   // ── Step 4: histograms + trees ──
   const cacheSize = opts.useColorCache ? 1 << opts.cacheBits : 0
@@ -230,7 +230,7 @@ function applySubtractGreen(argb: Uint32Array): void {
 // Tokenization (LZ77 + color cache + literal)
 // ---------------------------------------------------------------------------
 
-const enum TokenKind {
+enum TokenKind {
   Literal = 0,
   Backref = 1,
   Cache = 2,
@@ -255,7 +255,7 @@ type Token = LiteralToken | BackrefToken | CacheToken
  * the color cache independently — useful for debugging and for tests
  * that want to verify individual compression stages in isolation.
  */
-function tokenize(argb: Uint32Array, width: number, opts: InternalOptions): Token[] {
+function tokenize(argb: Uint32Array, opts: InternalOptions): Token[] {
   const tokens: Token[] = []
   const n = argb.length
 
