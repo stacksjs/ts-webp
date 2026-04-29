@@ -1,152 +1,125 @@
 /**
- * VP8 keyframe mode-info decoder.
+ * VP8 keyframe mode-info decoder — 1:1 port of libwebp's
+ * `ParseIntraMode` (src/dec/tree_dec.c).
  *
- * For each macroblock, the encoder records:
+ * For each macroblock we decode:
+ *   - segment id (if `segmentation.updateMap` is set)
+ *   - skip-coef flag (if `mb_no_skip_coef` is on)
+ *   - is_i4x4 (true if Y mode is B_PRED, false for the 16×16 modes)
+ *   - if 16×16: yMode ∈ {DC,V,H,TM}; if 4×4: 16 per-block B-modes
+ *   - uvMode ∈ {DC,V,H,TM}
  *
- *   - the 16×16 luma prediction mode (one of `DC_PRED`, `V_PRED`,
- *     `H_PRED`, `TM_PRED`, `B_PRED`)
- *   - if that mode is `B_PRED`: the 4×4 prediction mode for each of
- *     the 16 luma sub-blocks, contextually probability-coded against
- *     the modes of the immediate above + left sub-blocks
- *   - the chroma prediction mode (DC/V/H/TM)
+ * libwebp keeps two arrays of "B-mode along boundary":
+ *   - `intra_t[4*mb_x..4*mb_x+3]` — modes from the bottom row of the MB above
+ *   - `intra_l[0..3]` — modes from the right column of the MB to the left
  *
- * For non-keyframes there's an additional segment-id and skip-coef
- * field, but WebP only carries keyframes so we don't implement those.
- *
- * Reference: RFC 6386 §11, §16.
+ * For 16×16 MBs both are filled with the chosen yMode. For B_PRED MBs
+ * they're updated as we decode each sub-block.
  */
 import type { BoolDecoder } from './bool-decoder'
+import type { VP8SegmentHeader } from './header'
 import {
-  B_DC_PRED,
-  B_HE_PRED,
-  B_HU_PRED,
-  B_HD_PRED,
-  B_LD_PRED,
-  B_PRED,
-  B_RD_PRED,
-  B_TM_PRED,
-  B_VE_PRED,
-  B_VL_PRED,
-  B_VR_PRED,
-  B_MODE_TREE,
-  DC_PRED,
-  H_PRED,
-  KF_UV_MODE_PROBS,
-  KF_Y_MODE_PROBS,
-  KF_Y_MODE_TREE,
-  TM_PRED,
-  UV_MODE_TREE,
-  V_PRED,
-  kfBmodeProb,
+  B_DC_PRED, B_HD_PRED, B_HE_PRED, B_HU_PRED, B_LD_PRED, B_PRED, B_RD_PRED,
+  B_TM_PRED, B_VE_PRED, B_VL_PRED, B_VR_PRED, DC_PRED, H_PRED, TM_PRED, V_PRED,
 } from './tables'
 
-/**
- * Walk a probability-coded tree. `tree` is the flat tree array (pairs
- * of (left,right) where negative values are leaf modes encoded as
- * `-(mode+1)`-but-actually... see below). `probs` is the probability
- * vector keyed by node index. Returns the leaf mode.
- *
- * VP8's tree format: at each internal node, read one bit with
- * `probs[node>>1]`, follow `tree[node + bit]`. If the followed value
- * is non-positive it's a leaf returning `-leaf` (so the leaf code is
- * stored as a negative integer to disambiguate from indices).
- */
-function readTree(bool: BoolDecoder, tree: Int8Array, probs: Uint8Array | ArrayLike<number>): number {
-  let i = 0
-  while (true) {
-    const bit = bool.readBit(probs[i >> 1])
-    const next = tree[i + bit]
-    if (next <= 0) return -next
-    i = next
-  }
+export interface MBData {
+  /** Segment id (0..3). */
+  segment: number
+  /** True if the macroblock-level skip-coef flag was set. */
+  skip: boolean
+  /** True if the macroblock uses B_PRED (4×4 intra prediction). */
+  isI4x4: boolean
+  /** Y intra mode (when !isI4x4) or 16 per-subblock B-modes (when isI4x4). */
+  imodes: Uint8Array
+  /** Chroma intra mode. */
+  uvMode: number
+  /** Coefficient buffer (24 blocks × 16 coefs = 384 entries). */
+  coeffs: Int16Array
+  /** Bit-packed flags: see libwebp's `non_zero_y` / `non_zero_uv`. */
+  nonZeroY: number
+  nonZeroUV: number
+  /** Whether U/V/Y blocks contributed any non-zero coef (column tracker). */
+  nonZeroDc: number
 }
 
-/**
- * Decode the macroblock-level Y prediction mode for a keyframe.
- * Returns one of `DC_PRED`, `V_PRED`, `H_PRED`, `TM_PRED`, `B_PRED`.
- */
-export function decodeKeyframeYMode(bool: BoolDecoder): number {
-  return readTree(bool, KF_Y_MODE_TREE, KF_Y_MODE_PROBS)
-}
-
-/**
- * Decode the chroma prediction mode for a keyframe macroblock.
- * Returns one of `DC_PRED`, `V_PRED`, `H_PRED`, `TM_PRED`.
- */
-export function decodeKeyframeUVMode(bool: BoolDecoder): number {
-  return readTree(bool, UV_MODE_TREE, KF_UV_MODE_PROBS)
-}
-
-/**
- * Decode the 16 per-4×4 sub-block prediction modes for a B_PRED
- * macroblock, given the modes of the row of sub-blocks immediately
- * above (`aboveModes`, length 4) and the column to the left
- * (`leftModes`, length 4). Output is filled into `out` (length 16),
- * indexed in raster order (block 0 = top-left, block 15 = bottom-right).
- *
- * `aboveModes[i]` and `leftModes[i]` are mutated as we go so the next
- * macroblock can pick up the right boundary modes (we leave the
- * caller to copy out the relevant bottom row / right column).
- */
-export function decodeBPredModes(
-  bool: BoolDecoder,
-  aboveModes: Uint8Array,
+/** Decode mode info for one macroblock. Mirrors `ParseIntraMode`. */
+export function parseIntraMode(
+  br: BoolDecoder,
+  segmentation: VP8SegmentHeader,
+  useSkipProba: boolean,
+  skipP: number,
+  topModes: Uint8Array,
+  topModesOff: number,
   leftModes: Uint8Array,
-  out: Uint8Array,
+  block: MBData,
 ): void {
-  for (let y = 0; y < 4; y++) {
-    let leftMode = leftModes[y]
-    for (let x = 0; x < 4; x++) {
-      const above = aboveModes[x]
-      const left = leftMode
-      const mode = readBmode(bool, above, left)
-      out[y * 4 + x] = mode
-      aboveModes[x] = mode
-      leftMode = mode
+  // Segment id (rarely used in WebP).
+  if (segmentation.updateMap) {
+    const p = segmentation.segmentTreeProbs
+    block.segment = !br.readBit(p[0])
+      ? br.readBit(p[1])
+      : br.readBit(p[2]) + 2
+  }
+  else {
+    block.segment = 0
+  }
+  if (useSkipProba) {
+    block.skip = br.readBit(skipP) === 1
+  }
+
+  block.isI4x4 = !br.readBit(145)
+  if (!block.isI4x4) {
+    // 16×16 prediction (one mode for the whole MB).
+    const ymode = br.readBit(156)
+      ? (br.readBit(128) ? TM_PRED : H_PRED)
+      : (br.readBit(163) ? V_PRED : DC_PRED)
+    block.imodes[0] = ymode
+    for (let i = 0; i < 4; i++) {
+      topModes[topModesOff + i] = ymode
+      leftModes[i] = ymode
     }
-    leftModes[y] = leftMode
   }
-}
-
-/**
- * Decode a single 4×4 intra mode, contextually probability-coded
- * against the (above, left) neighbour-modes via `kfBmodeProb`.
- */
-function readBmode(bool: BoolDecoder, above: number, left: number): number {
-  // The B-mode tree has 10 leaves and uses 9 probabilities (one per
-  // internal node). `kfBmodeProb(above, left, idx)` produces the
-  // probability vector for this neighbour pair.
-  const probs = [
-    kfBmodeProb(above, left, 0),
-    kfBmodeProb(above, left, 1),
-    kfBmodeProb(above, left, 2),
-    kfBmodeProb(above, left, 3),
-    kfBmodeProb(above, left, 4),
-    kfBmodeProb(above, left, 5),
-    kfBmodeProb(above, left, 6),
-    kfBmodeProb(above, left, 7),
-    kfBmodeProb(above, left, 8),
-  ]
-  return readTree(bool, /* B_MODE_TREE */ B_MODE_TREE, probs)
-}
-
-/** "B-mode" sentinel for a sub-block taken from a non-B_PRED macroblock.
- * When a non-B_PRED MB sits above or to the left of a B_PRED MB, its
- * 4×4 sub-blocks are treated as having a single "implied" B-mode based
- * on the macroblock's 16×16 mode. This map is from §11.6. */
-export function impliedBmode(mbMode: number): number {
-  switch (mbMode) {
-    case DC_PRED: return B_DC_PRED
-    case V_PRED: return B_VE_PRED
-    case H_PRED: return B_HE_PRED
-    case TM_PRED: return B_TM_PRED
-    default: return B_DC_PRED // includes B_PRED itself, which shouldn't reach here
+  else {
+    // 4×4 prediction (16 sub-block modes).
+    let mIdx = 0
+    for (let y = 0; y < 4; y++) {
+      let ymode = leftModes[y]
+      for (let x = 0; x < 4; x++) {
+        const probs = kfBmodeProbsAt(topModes[topModesOff + x], ymode)
+        ymode = readBmode(br, probs)
+        topModes[topModesOff + x] = ymode
+        block.imodes[mIdx++] = ymode
+      }
+      leftModes[y] = ymode
+    }
   }
+
+  // UV mode (DC/V/H/TM).
+  block.uvMode = !br.readBit(142)
+    ? DC_PRED
+    : (!br.readBit(114)
+        ? V_PRED
+        : (br.readBit(183) ? TM_PRED : H_PRED))
 }
 
-// Re-export mode constants so consumers don't need to pull them from tables.
-export {
-  B_DC_PRED, B_TM_PRED, B_VE_PRED, B_HE_PRED, B_LD_PRED,
-  B_RD_PRED, B_VR_PRED, B_VL_PRED, B_HD_PRED, B_HU_PRED,
-  B_PRED, DC_PRED, V_PRED, H_PRED, TM_PRED,
+/** Decode a 4×4 B-mode given the 9-element `[above, left]` probability vector. */
+function readBmode(br: BoolDecoder, prob: Uint8Array): number {
+  if (!br.readBit(prob[0])) return B_DC_PRED
+  if (!br.readBit(prob[1])) return B_TM_PRED
+  if (!br.readBit(prob[2])) return B_VE_PRED
+  if (!br.readBit(prob[3])) {
+    if (!br.readBit(prob[4])) return B_HE_PRED
+    return br.readBit(prob[5]) ? B_VR_PRED : B_RD_PRED
+  }
+  if (!br.readBit(prob[6])) return B_LD_PRED
+  if (!br.readBit(prob[7])) return B_VL_PRED
+  return br.readBit(prob[8]) ? B_HU_PRED : B_HD_PRED
+}
+
+import { KF_BMODE_PROBS, NUM_BMODES } from './tables'
+
+function kfBmodeProbsAt(above: number, left: number): Uint8Array {
+  const off = (above * NUM_BMODES + left) * (NUM_BMODES - 1)
+  return KF_BMODE_PROBS.subarray(off, off + (NUM_BMODES - 1))
 }

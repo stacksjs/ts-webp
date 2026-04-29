@@ -1,318 +1,438 @@
 /**
  * VP8 intra prediction.
  *
- * Three families of predictors:
- *   - 16×16 luma: DC/V/H/TM (4 modes) — bulk-fills a 16×16 patch from
- *     the row above and column to the left.
- *   - 4×4 luma (B-modes, 10 of them): finer-grained directional
- *     predictors used when the macroblock is in `B_PRED` mode.
- *   - 8×8 chroma: same 4 modes as 16×16 luma but applied to the U
- *     and V planes.
- *
- * All predictors take a destination buffer plus references to the row
- * directly above (`top`) and the column directly to the left (`left`).
- * Edge macroblocks/sub-blocks use the spec's special boundary values:
- *   - top row of the frame:    top[i] = 127
- *   - left column of the frame: left[i] = 129
- *   - top-left corner:          129
- *
- * Reference: RFC 6386 §12, libvpx `vp8/common/reconintra4.c`.
+ * 1:1 port of libwebp's `VP8PredLuma16`, `VP8PredLuma4`, and
+ * `VP8PredChroma8` (src/dsp/dec.c). Predictors read neighbour samples
+ * directly from the destination buffer at offsets `-1` (left column),
+ * `-BPS` (row above), and `-1 - BPS` (top-left corner). The caller is
+ * responsible for arranging the buffer with the right surrounding
+ * context — see decoder.ts `ReconstructRow` for the layout.
  */
 
-import {
-  B_DC_PRED,
-  B_HD_PRED,
-  B_HE_PRED,
-  B_HU_PRED,
-  B_LD_PRED,
-  B_RD_PRED,
-  B_TM_PRED,
-  B_VE_PRED,
-  B_VL_PRED,
-  B_VR_PRED,
-  DC_PRED,
-  H_PRED,
-  TM_PRED,
-  V_PRED,
-} from './tables'
-import { clip255 } from './idct'
+/** Stride between rows in the per-macroblock YUV buffer. */
+export const BPS = 32
 
-// ---------------------------------------------------------------------------
-// 16×16 luma intra prediction (also used for 8×8 chroma with n=8)
-// ---------------------------------------------------------------------------
+// Mode constants — libwebp keeps separate "no-top", "no-left",
+// "no-top-left" variants of 16×16/chroma DC for the missing-neighbour
+// edge cases.
+export const DC_PRED = 0
+export const V_PRED = 1
+export const H_PRED = 2
+export const TM_PRED = 3
+export const B_PRED = 4
+export const B_DC_PRED_NOTOP = 4
+export const B_DC_PRED_NOLEFT = 5
+export const B_DC_PRED_NOTOPLEFT = 6
+export const NUM_B_DC_MODES = 7
 
-export function predict16x16(
-  mode: number,
-  dst: Uint8Array,
-  stride: number,
-  off: number,
-  top: Uint8Array,
-  left: Uint8Array,
-  topLeft: number,
-  hasTop: boolean,
-  hasLeft: boolean,
-): void {
-  predictNxN(mode, dst, stride, off, top, left, topLeft, hasTop, hasLeft, 16)
+// 4×4 B-modes
+export const B_DC = 0
+export const B_TM = 1
+export const B_VE = 2
+export const B_HE = 3
+export const B_LD = 4
+export const B_RD = 5
+export const B_VR = 6
+export const B_VL = 7
+export const B_HD = 8
+export const B_HU = 9
+export const NUM_BMODES = 10
+
+function clip8(v: number): number {
+  return v < 0 ? 0 : v > 255 ? 255 : v
 }
 
-export function predictChroma8x8(
-  mode: number,
-  dst: Uint8Array,
-  stride: number,
-  off: number,
-  top: Uint8Array,
-  left: Uint8Array,
-  topLeft: number,
-  hasTop: boolean,
-  hasLeft: boolean,
-): void {
-  predictNxN(mode, dst, stride, off, top, left, topLeft, hasTop, hasLeft, 8)
-}
+// ---------------------------------------------------------------------------
+// 16×16 luma predictors (port of libwebp's `VP8PredLuma16` table)
+// ---------------------------------------------------------------------------
 
-function predictNxN(
-  mode: number,
-  dst: Uint8Array, stride: number, off: number,
-  top: Uint8Array, left: Uint8Array, topLeft: number,
-  hasTop: boolean, hasLeft: boolean,
-  n: number,
-): void {
-  switch (mode) {
-    case V_PRED:
-      for (let y = 0; y < n; y++)
-        for (let x = 0; x < n; x++)
-          dst[off + y * stride + x] = top[x]
-      break
-    case H_PRED:
-      for (let y = 0; y < n; y++)
-        for (let x = 0; x < n; x++)
-          dst[off + y * stride + x] = left[y]
-      break
-    case TM_PRED:
-      for (let y = 0; y < n; y++)
-        for (let x = 0; x < n; x++)
-          dst[off + y * stride + x] = clip255(top[x] + left[y] - topLeft)
-      break
-    case DC_PRED:
-    default: {
-      let sum = 0
-      let count = 0
-      if (hasTop) {
-        for (let i = 0; i < n; i++) sum += top[i]
-        count += n
-      }
-      if (hasLeft) {
-        for (let i = 0; i < n; i++) sum += left[i]
-        count += n
-      }
-      const dc = count === 0 ? 128 : (sum + (count >> 1)) / count | 0
-      for (let y = 0; y < n; y++)
-        for (let x = 0; x < n; x++)
-          dst[off + y * stride + x] = dc
-      break
-    }
+function ve16(dst: Uint8Array, off: number): void {
+  // Vertical: copy row above into all 16 rows.
+  for (let j = 0; j < 16; j++) {
+    for (let x = 0; x < 16; x++) dst[off + j * BPS + x] = dst[off - BPS + x]
   }
 }
 
-// ---------------------------------------------------------------------------
-// 4×4 luma intra prediction (B-modes)
-// ---------------------------------------------------------------------------
+function he16(dst: Uint8Array, off: number): void {
+  // Horizontal: replicate left column across each row.
+  for (let j = 0; j < 16; j++) {
+    const v = dst[off + j * BPS - 1]
+    for (let x = 0; x < 16; x++) dst[off + j * BPS + x] = v
+  }
+}
+
+function put16(value: number, dst: Uint8Array, off: number): void {
+  for (let j = 0; j < 16; j++)
+    for (let x = 0; x < 16; x++)
+      dst[off + j * BPS + x] = value
+}
+
+function dc16(dst: Uint8Array, off: number): void {
+  let dc = 16
+  for (let j = 0; j < 16; j++) dc += dst[off - 1 + j * BPS] + dst[off + j - BPS]
+  put16(dc >> 5, dst, off)
+}
+
+function dc16NoTop(dst: Uint8Array, off: number): void {
+  let dc = 8
+  for (let j = 0; j < 16; j++) dc += dst[off - 1 + j * BPS]
+  put16(dc >> 4, dst, off)
+}
+
+function dc16NoLeft(dst: Uint8Array, off: number): void {
+  let dc = 8
+  for (let i = 0; i < 16; i++) dc += dst[off + i - BPS]
+  put16(dc >> 4, dst, off)
+}
+
+function dc16NoTopLeft(dst: Uint8Array, off: number): void {
+  put16(0x80, dst, off)
+}
+
+function tm16(dst: Uint8Array, off: number): void {
+  trueMotion(dst, off, 16)
+}
+
+/** Table-driven 16×16 dispatch. */
+export const VP8PredLuma16: ReadonlyArray<(dst: Uint8Array, off: number) => void> = [
+  dc16, // DC_PRED
+  tm16, // TM_PRED — note libwebp orders modes differently; we apply mapping below
+  ve16, // V_PRED
+  he16, // H_PRED
+  dc16NoTop, // B_DC_PRED_NOTOP
+  dc16NoLeft, // B_DC_PRED_NOLEFT
+  dc16NoTopLeft, // B_DC_PRED_NOTOPLEFT
+]
 
 /**
- * Predict a 4×4 sub-block. Inputs:
- *   - `dst` / `stride` / `off`: destination 4×4 patch
- *   - `top`: 8 pixels above the block — top[0..3] = direct above (A,B,C,D),
- *     top[4..7] = above-right extension (E,F,G,H). Missing pixels use 127.
- *   - `left`: 4 pixels to the left of the block (rows y..y+3) (I,J,K,L).
- *   - `topLeft` (X): the single pixel at (above, left) corner.
- *
- * Implementation follows libvpx's reconintra4.c exactly. Each output
- * pixel is assigned explicitly so the diagonal modes are immune to
- * indexing errors.
+ * Apply a 16×16 luma predictor by mode. The `mode` value is the
+ * decoder's logical mode (DC_PRED=0, V_PRED=1, H_PRED=2, TM_PRED=3) or
+ * one of the variants used at frame edges.
  */
-export function predictB(
-  mode: number,
-  dst: Uint8Array,
-  stride: number,
-  off: number,
-  top: Uint8Array,
-  left: Uint8Array,
-  topLeft: number,
-): void {
-  const A = top[0], B = top[1], C = top[2], D = top[3]
-  const E = top[4], F = top[5], G = top[6], H = top[7]
-  const I = left[0], J = left[1], K = left[2], L = left[3]
-  const X = topLeft
-
-  // Cell-write helper.
-  const w = (x: number, y: number, v: number): void => {
-    dst[off + y * stride + x] = clip255(v)
-  }
-
-  // Average filters.
-  const a2 = (a: number, b: number): number => (a + b + 1) >> 1
-  const a3 = (a: number, b: number, c: number): number => (a + 2 * b + c + 2) >> 2
-
+export function predictLuma16(mode: number, dst: Uint8Array, off: number): void {
   switch (mode) {
-    case B_DC_PRED: {
-      const dc = (A + B + C + D + I + J + K + L + 4) >> 3
-      for (let y = 0; y < 4; y++)
-        for (let x = 0; x < 4; x++)
-          w(x, y, dc)
-      break
-    }
-    case B_TM_PRED: {
-      for (let y = 0; y < 4; y++) {
-        const ly = left[y]
-        for (let x = 0; x < 4; x++)
-          w(x, y, top[x] + ly - X)
-      }
-      break
-    }
-    case B_VE_PRED: {
-      const v0 = a3(X, A, B)
-      const v1 = a3(A, B, C)
-      const v2 = a3(B, C, D)
-      const v3 = a3(C, D, E)
-      for (let y = 0; y < 4; y++) {
-        w(0, y, v0); w(1, y, v1); w(2, y, v2); w(3, y, v3)
-      }
-      break
-    }
-    case B_HE_PRED: {
-      const h0 = a3(X, I, J)
-      const h1 = a3(I, J, K)
-      const h2 = a3(J, K, L)
-      const h3 = a3(K, L, L)
-      for (let x = 0; x < 4; x++) {
-        w(x, 0, h0); w(x, 1, h1); w(x, 2, h2); w(x, 3, h3)
-      }
-      break
-    }
-    case B_LD_PRED: {
-      // 45° down-left. Uses A..H.
-      const d0 = a3(A, B, C)
-      const d1 = a3(B, C, D)
-      const d2 = a3(C, D, E)
-      const d3 = a3(D, E, F)
-      const d4 = a3(E, F, G)
-      const d5 = a3(F, G, H)
-      const d6 = a3(G, H, H)
-      w(0, 0, d0)
-      w(1, 0, d1); w(0, 1, d1)
-      w(2, 0, d2); w(1, 1, d2); w(0, 2, d2)
-      w(3, 0, d3); w(2, 1, d3); w(1, 2, d3); w(0, 3, d3)
-      w(3, 1, d4); w(2, 2, d4); w(1, 3, d4)
-      w(3, 2, d5); w(2, 3, d5)
-      w(3, 3, d6)
-      break
-    }
-    case B_RD_PRED: {
-      // 45° down-right. Diagonal indexed by (col - row + 3).
-      const e0 = a3(L, K, J)
-      const e1 = a3(K, J, I)
-      const e2 = a3(J, I, X)
-      const e3 = a3(I, X, A)
-      const e4 = a3(X, A, B)
-      const e5 = a3(A, B, C)
-      const e6 = a3(B, C, D)
-      // (col, row) → e[col - row + 3]
-      w(0, 3, e0)
-      w(0, 2, e1); w(1, 3, e1)
-      w(0, 1, e2); w(1, 2, e2); w(2, 3, e2)
-      w(0, 0, e3); w(1, 1, e3); w(2, 2, e3); w(3, 3, e3)
-      w(1, 0, e4); w(2, 1, e4); w(3, 2, e4)
-      w(2, 0, e5); w(3, 1, e5)
-      w(3, 0, e6)
-      break
-    }
-    case B_VR_PRED: {
-      w(0, 0, a2(X, A))
-      w(1, 0, a2(A, B))
-      w(2, 0, a2(B, C))
-      w(3, 0, a2(C, D))
+    case DC_PRED: dc16(dst, off); break
+    case V_PRED: ve16(dst, off); break
+    case H_PRED: he16(dst, off); break
+    case TM_PRED: tm16(dst, off); break
+    case B_DC_PRED_NOTOP: dc16NoTop(dst, off); break
+    case B_DC_PRED_NOLEFT: dc16NoLeft(dst, off); break
+    case B_DC_PRED_NOTOPLEFT: dc16NoTopLeft(dst, off); break
+  }
+}
 
-      w(0, 1, a3(I, X, A))
-      w(1, 1, a3(X, A, B))
-      w(2, 1, a3(A, B, C))
-      w(3, 1, a3(B, C, D))
+// ---------------------------------------------------------------------------
+// 8×8 chroma predictors
+// ---------------------------------------------------------------------------
 
-      w(0, 2, a2(X, A))
-      w(1, 2, a2(A, B))
-      w(2, 2, a2(B, C))
-      w(3, 2, a2(C, D))
+function put8x8(value: number, dst: Uint8Array, off: number): void {
+  for (let j = 0; j < 8; j++)
+    for (let x = 0; x < 8; x++)
+      dst[off + j * BPS + x] = value
+}
 
-      w(0, 3, a3(J, I, X))
-      w(1, 3, a3(I, X, A))
-      w(2, 3, a3(X, A, B))
-      w(3, 3, a3(A, B, C))
-      break
+function dc8uv(dst: Uint8Array, off: number): void {
+  let dc = 8
+  for (let i = 0; i < 8; i++) dc += dst[off + i - BPS] + dst[off - 1 + i * BPS]
+  put8x8(dc >> 4, dst, off)
+}
+
+function dc8uvNoTop(dst: Uint8Array, off: number): void {
+  let dc = 4
+  for (let i = 0; i < 8; i++) dc += dst[off - 1 + i * BPS]
+  put8x8(dc >> 3, dst, off)
+}
+
+function dc8uvNoLeft(dst: Uint8Array, off: number): void {
+  let dc = 4
+  for (let i = 0; i < 8; i++) dc += dst[off + i - BPS]
+  put8x8(dc >> 3, dst, off)
+}
+
+function dc8uvNoTopLeft(dst: Uint8Array, off: number): void {
+  put8x8(0x80, dst, off)
+}
+
+function ve8uv(dst: Uint8Array, off: number): void {
+  for (let j = 0; j < 8; j++)
+    for (let x = 0; x < 8; x++)
+      dst[off + j * BPS + x] = dst[off - BPS + x]
+}
+
+function he8uv(dst: Uint8Array, off: number): void {
+  for (let j = 0; j < 8; j++) {
+    const v = dst[off + j * BPS - 1]
+    for (let x = 0; x < 8; x++) dst[off + j * BPS + x] = v
+  }
+}
+
+function tm8uv(dst: Uint8Array, off: number): void {
+  trueMotion(dst, off, 8)
+}
+
+export function predictChroma8(mode: number, dst: Uint8Array, off: number): void {
+  switch (mode) {
+    case DC_PRED: dc8uv(dst, off); break
+    case V_PRED: ve8uv(dst, off); break
+    case H_PRED: he8uv(dst, off); break
+    case TM_PRED: tm8uv(dst, off); break
+    case B_DC_PRED_NOTOP: dc8uvNoTop(dst, off); break
+    case B_DC_PRED_NOLEFT: dc8uvNoLeft(dst, off); break
+    case B_DC_PRED_NOTOPLEFT: dc8uvNoTopLeft(dst, off); break
+  }
+}
+
+// ---------------------------------------------------------------------------
+// True-motion predictor — clip(top[x] + left[y] - top_left)
+// ---------------------------------------------------------------------------
+
+function trueMotion(dst: Uint8Array, off: number, size: number): void {
+  const topLeftIdx = off - 1 - BPS
+  const topLeft = dst[topLeftIdx]
+  for (let y = 0; y < size; y++) {
+    const lefty = dst[off + y * BPS - 1]
+    for (let x = 0; x < size; x++) {
+      dst[off + y * BPS + x] = clip8(dst[off - BPS + x] + lefty - topLeft)
     }
-    case B_VL_PRED: {
-      w(0, 0, a2(A, B))
-      w(1, 0, a2(B, C))
-      w(2, 0, a2(C, D))
-      w(3, 0, a2(D, E))
+  }
+}
 
-      w(0, 1, a3(A, B, C))
-      w(1, 1, a3(B, C, D))
-      w(2, 1, a3(C, D, E))
-      w(3, 1, a3(D, E, F))
+// ---------------------------------------------------------------------------
+// 4×4 B-modes (port of libwebp's VE4_C/HE4_C/DC4_C/RD4_C/LD4_C/VR4_C/VL4_C/HD4_C/HU4_C/TM4_C)
+// ---------------------------------------------------------------------------
 
-      w(0, 2, a2(B, C))
-      w(1, 2, a2(C, D))
-      w(2, 2, a2(D, E))
-      w(3, 2, a2(E, F))
+const avg2 = (a: number, b: number): number => (a + b + 1) >> 1
+const avg3 = (a: number, b: number, c: number): number => (a + 2 * b + c + 2) >> 2
 
-      w(0, 3, a3(B, C, D))
-      w(1, 3, a3(C, D, E))
-      w(2, 3, a3(D, E, F))
-      w(3, 3, a3(E, F, G))
-      break
-    }
-    case B_HD_PRED: {
-      // Horizontal-down. Diagonal indexed by (2*row - col + 3).
-      const h0 = a2(L, K)
-      const h1 = a3(L, K, J)
-      const h2 = a2(K, J)
-      const h3 = a3(K, J, I)
-      const h4 = a2(J, I)
-      const h5 = a3(J, I, X)
-      const h6 = a2(I, X)
-      const h7 = a3(I, X, A)
-      const h8 = a3(X, A, B)
-      const h9 = a3(A, B, C)
-      // (col, row):
-      w(0, 3, h0)
-      w(1, 3, h1)
-      w(0, 2, h2); w(2, 3, h2)
-      w(1, 2, h3); w(3, 3, h3)
-      w(0, 1, h4); w(2, 2, h4)
-      w(1, 1, h5); w(3, 2, h5)
-      w(0, 0, h6); w(2, 1, h6)
-      w(1, 0, h7); w(3, 1, h7)
-      w(2, 0, h8)
-      w(3, 0, h9)
-      break
-    }
-    case B_HU_PRED: {
-      // Horizontal-up.
-      const u0 = a2(I, J)
-      const u1 = a3(I, J, K)
-      const u2 = a2(J, K)
-      const u3 = a3(J, K, L)
-      const u4 = a2(K, L)
-      const u5 = a3(K, L, L)
-      // For rows ≥ 3, all pixels are L (filled below).
-      w(0, 0, u0)
-      w(1, 0, u1)
-      w(2, 0, u2); w(0, 1, u2)
-      w(3, 0, u3); w(1, 1, u3)
-      w(2, 1, u4); w(0, 2, u4)
-      w(3, 1, u5); w(1, 2, u5)
-      w(2, 2, L); w(0, 3, L)
-      w(3, 2, L); w(1, 3, L)
-      w(2, 3, L); w(3, 3, L)
-      break
-    }
+function tm4(dst: Uint8Array, off: number): void {
+  trueMotion(dst, off, 4)
+}
+
+function ve4(dst: Uint8Array, off: number): void {
+  // top samples at dst[off - BPS - 1 .. off - BPS + 3]
+  const t0 = dst[off - BPS - 1]
+  const t1 = dst[off - BPS + 0]
+  const t2 = dst[off - BPS + 1]
+  const t3 = dst[off - BPS + 2]
+  const t4 = dst[off - BPS + 3]
+  const t5 = dst[off - BPS + 4]
+  const v0 = avg3(t0, t1, t2)
+  const v1 = avg3(t1, t2, t3)
+  const v2 = avg3(t2, t3, t4)
+  const v3 = avg3(t3, t4, t5)
+  for (let i = 0; i < 4; i++) {
+    const base = off + i * BPS
+    dst[base + 0] = v0
+    dst[base + 1] = v1
+    dst[base + 2] = v2
+    dst[base + 3] = v3
+  }
+}
+
+function he4(dst: Uint8Array, off: number): void {
+  const A = dst[off - 1 - BPS]
+  const B = dst[off - 1]
+  const C = dst[off - 1 + BPS]
+  const D = dst[off - 1 + 2 * BPS]
+  const E = dst[off - 1 + 3 * BPS]
+  const v0 = avg3(A, B, C)
+  const v1 = avg3(B, C, D)
+  const v2 = avg3(C, D, E)
+  const v3 = avg3(D, E, E)
+  for (let x = 0; x < 4; x++) dst[off + 0 * BPS + x] = v0
+  for (let x = 0; x < 4; x++) dst[off + 1 * BPS + x] = v1
+  for (let x = 0; x < 4; x++) dst[off + 2 * BPS + x] = v2
+  for (let x = 0; x < 4; x++) dst[off + 3 * BPS + x] = v3
+}
+
+function dc4(dst: Uint8Array, off: number): void {
+  let dc = 4
+  for (let i = 0; i < 4; i++) dc += dst[off + i - BPS] + dst[off - 1 + i * BPS]
+  dc >>= 3
+  for (let i = 0; i < 4; i++)
+    for (let x = 0; x < 4; x++)
+      dst[off + i * BPS + x] = dc
+}
+
+// Helper for the diagonal predictors — write at (col, row).
+function setPixel(dst: Uint8Array, off: number, col: number, row: number, v: number): void {
+  dst[off + col + row * BPS] = v
+}
+
+function rd4(dst: Uint8Array, off: number): void {
+  const I = dst[off - 1 + 0 * BPS]
+  const J = dst[off - 1 + 1 * BPS]
+  const K = dst[off - 1 + 2 * BPS]
+  const L = dst[off - 1 + 3 * BPS]
+  const X = dst[off - 1 - BPS]
+  const A = dst[off + 0 - BPS]
+  const B = dst[off + 1 - BPS]
+  const C = dst[off + 2 - BPS]
+  const D = dst[off + 3 - BPS]
+  setPixel(dst, off, 0, 3, avg3(J, K, L))
+  setPixel(dst, off, 0, 2, avg3(I, J, K))
+  setPixel(dst, off, 1, 3, avg3(I, J, K))
+  setPixel(dst, off, 0, 1, avg3(X, I, J))
+  setPixel(dst, off, 1, 2, avg3(X, I, J))
+  setPixel(dst, off, 2, 3, avg3(X, I, J))
+  setPixel(dst, off, 0, 0, avg3(A, X, I))
+  setPixel(dst, off, 1, 1, avg3(A, X, I))
+  setPixel(dst, off, 2, 2, avg3(A, X, I))
+  setPixel(dst, off, 3, 3, avg3(A, X, I))
+  setPixel(dst, off, 1, 0, avg3(B, A, X))
+  setPixel(dst, off, 2, 1, avg3(B, A, X))
+  setPixel(dst, off, 3, 2, avg3(B, A, X))
+  setPixel(dst, off, 2, 0, avg3(C, B, A))
+  setPixel(dst, off, 3, 1, avg3(C, B, A))
+  setPixel(dst, off, 3, 0, avg3(D, C, B))
+}
+
+function ld4(dst: Uint8Array, off: number): void {
+  const A = dst[off + 0 - BPS]
+  const B = dst[off + 1 - BPS]
+  const C = dst[off + 2 - BPS]
+  const D = dst[off + 3 - BPS]
+  const E = dst[off + 4 - BPS]
+  const F = dst[off + 5 - BPS]
+  const G = dst[off + 6 - BPS]
+  const H = dst[off + 7 - BPS]
+  setPixel(dst, off, 0, 0, avg3(A, B, C))
+  setPixel(dst, off, 1, 0, avg3(B, C, D))
+  setPixel(dst, off, 0, 1, avg3(B, C, D))
+  setPixel(dst, off, 2, 0, avg3(C, D, E))
+  setPixel(dst, off, 1, 1, avg3(C, D, E))
+  setPixel(dst, off, 0, 2, avg3(C, D, E))
+  setPixel(dst, off, 3, 0, avg3(D, E, F))
+  setPixel(dst, off, 2, 1, avg3(D, E, F))
+  setPixel(dst, off, 1, 2, avg3(D, E, F))
+  setPixel(dst, off, 0, 3, avg3(D, E, F))
+  setPixel(dst, off, 3, 1, avg3(E, F, G))
+  setPixel(dst, off, 2, 2, avg3(E, F, G))
+  setPixel(dst, off, 1, 3, avg3(E, F, G))
+  setPixel(dst, off, 3, 2, avg3(F, G, H))
+  setPixel(dst, off, 2, 3, avg3(F, G, H))
+  setPixel(dst, off, 3, 3, avg3(G, H, H))
+}
+
+function vr4(dst: Uint8Array, off: number): void {
+  const I = dst[off - 1 + 0 * BPS]
+  const J = dst[off - 1 + 1 * BPS]
+  const K = dst[off - 1 + 2 * BPS]
+  const X = dst[off - 1 - BPS]
+  const A = dst[off + 0 - BPS]
+  const B = dst[off + 1 - BPS]
+  const C = dst[off + 2 - BPS]
+  const D = dst[off + 3 - BPS]
+  setPixel(dst, off, 0, 0, avg2(X, A))
+  setPixel(dst, off, 1, 2, avg2(X, A))
+  setPixel(dst, off, 1, 0, avg2(A, B))
+  setPixel(dst, off, 2, 2, avg2(A, B))
+  setPixel(dst, off, 2, 0, avg2(B, C))
+  setPixel(dst, off, 3, 2, avg2(B, C))
+  setPixel(dst, off, 3, 0, avg2(C, D))
+
+  setPixel(dst, off, 0, 3, avg3(K, J, I))
+  setPixel(dst, off, 0, 2, avg3(J, I, X))
+  setPixel(dst, off, 0, 1, avg3(I, X, A))
+  setPixel(dst, off, 1, 3, avg3(I, X, A))
+  setPixel(dst, off, 1, 1, avg3(X, A, B))
+  setPixel(dst, off, 2, 3, avg3(X, A, B))
+  setPixel(dst, off, 2, 1, avg3(A, B, C))
+  setPixel(dst, off, 3, 3, avg3(A, B, C))
+  setPixel(dst, off, 3, 1, avg3(B, C, D))
+}
+
+function vl4(dst: Uint8Array, off: number): void {
+  const A = dst[off + 0 - BPS]
+  const B = dst[off + 1 - BPS]
+  const C = dst[off + 2 - BPS]
+  const D = dst[off + 3 - BPS]
+  const E = dst[off + 4 - BPS]
+  const F = dst[off + 5 - BPS]
+  const G = dst[off + 6 - BPS]
+  const H = dst[off + 7 - BPS]
+  setPixel(dst, off, 0, 0, avg2(A, B))
+  setPixel(dst, off, 1, 0, avg2(B, C))
+  setPixel(dst, off, 0, 2, avg2(B, C))
+  setPixel(dst, off, 2, 0, avg2(C, D))
+  setPixel(dst, off, 1, 2, avg2(C, D))
+  setPixel(dst, off, 3, 0, avg2(D, E))
+  setPixel(dst, off, 2, 2, avg2(D, E))
+
+  setPixel(dst, off, 0, 1, avg3(A, B, C))
+  setPixel(dst, off, 1, 1, avg3(B, C, D))
+  setPixel(dst, off, 0, 3, avg3(B, C, D))
+  setPixel(dst, off, 2, 1, avg3(C, D, E))
+  setPixel(dst, off, 1, 3, avg3(C, D, E))
+  setPixel(dst, off, 3, 1, avg3(D, E, F))
+  setPixel(dst, off, 2, 3, avg3(D, E, F))
+  setPixel(dst, off, 3, 2, avg3(E, F, G))
+  setPixel(dst, off, 3, 3, avg3(F, G, H))
+}
+
+function hu4(dst: Uint8Array, off: number): void {
+  const I = dst[off - 1 + 0 * BPS]
+  const J = dst[off - 1 + 1 * BPS]
+  const K = dst[off - 1 + 2 * BPS]
+  const L = dst[off - 1 + 3 * BPS]
+  setPixel(dst, off, 0, 0, avg2(I, J))
+  setPixel(dst, off, 2, 0, avg2(J, K))
+  setPixel(dst, off, 0, 1, avg2(J, K))
+  setPixel(dst, off, 2, 1, avg2(K, L))
+  setPixel(dst, off, 0, 2, avg2(K, L))
+  setPixel(dst, off, 1, 0, avg3(I, J, K))
+  setPixel(dst, off, 3, 0, avg3(J, K, L))
+  setPixel(dst, off, 1, 1, avg3(J, K, L))
+  setPixel(dst, off, 3, 1, avg3(K, L, L))
+  setPixel(dst, off, 1, 2, avg3(K, L, L))
+  setPixel(dst, off, 3, 2, L)
+  setPixel(dst, off, 2, 2, L)
+  setPixel(dst, off, 0, 3, L)
+  setPixel(dst, off, 1, 3, L)
+  setPixel(dst, off, 2, 3, L)
+  setPixel(dst, off, 3, 3, L)
+}
+
+function hd4(dst: Uint8Array, off: number): void {
+  const I = dst[off - 1 + 0 * BPS]
+  const J = dst[off - 1 + 1 * BPS]
+  const K = dst[off - 1 + 2 * BPS]
+  const L = dst[off - 1 + 3 * BPS]
+  const X = dst[off - 1 - BPS]
+  const A = dst[off + 0 - BPS]
+  const B = dst[off + 1 - BPS]
+  const C = dst[off + 2 - BPS]
+  setPixel(dst, off, 0, 0, avg2(I, X))
+  setPixel(dst, off, 2, 1, avg2(I, X))
+  setPixel(dst, off, 0, 1, avg2(J, I))
+  setPixel(dst, off, 2, 2, avg2(J, I))
+  setPixel(dst, off, 0, 2, avg2(K, J))
+  setPixel(dst, off, 2, 3, avg2(K, J))
+  setPixel(dst, off, 0, 3, avg2(L, K))
+
+  setPixel(dst, off, 3, 0, avg3(A, B, C))
+  setPixel(dst, off, 2, 0, avg3(X, A, B))
+  setPixel(dst, off, 1, 0, avg3(I, X, A))
+  setPixel(dst, off, 3, 1, avg3(I, X, A))
+  setPixel(dst, off, 1, 1, avg3(J, I, X))
+  setPixel(dst, off, 3, 2, avg3(J, I, X))
+  setPixel(dst, off, 1, 2, avg3(K, J, I))
+  setPixel(dst, off, 3, 3, avg3(K, J, I))
+  setPixel(dst, off, 1, 3, avg3(L, K, J))
+}
+
+/** Dispatch a 4×4 B-mode predictor by mode index. */
+export function predictLuma4(mode: number, dst: Uint8Array, off: number): void {
+  switch (mode) {
+    case B_DC: dc4(dst, off); break
+    case B_TM: tm4(dst, off); break
+    case B_VE: ve4(dst, off); break
+    case B_HE: he4(dst, off); break
+    case B_LD: ld4(dst, off); break
+    case B_RD: rd4(dst, off); break
+    case B_VR: vr4(dst, off); break
+    case B_VL: vl4(dst, off); break
+    case B_HD: hd4(dst, off); break
+    case B_HU: hu4(dst, off); break
   }
 }

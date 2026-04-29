@@ -1,88 +1,132 @@
 import type { VP8FrameHeader } from '../types'
 import { BoolDecoder } from './bool-decoder'
-import { DEFAULT_COEF_PROBS, NUM_BLOCK_TYPES, NUM_COEF_BANDS } from './tables'
+import {
+  AC_QUANT,
+  COEF_UPDATE_PROBS,
+  DC_QUANT,
+  DEFAULT_COEF_PROBS,
+  NUM_BLOCK_TYPES,
+  NUM_COEF_BANDS,
+  clampQi,
+} from './tables'
 
 /**
- * VP8 keyframe header parser.
+ * VP8 keyframe header parser — 1:1 port of libwebp's `VP8GetHeaders`,
+ * `ParseSegmentHeader`, `ParseFilterHeader`, `ParsePartitions`,
+ * `VP8ParseQuant`, and `VP8ParseProba` (src/dec/vp8_dec.c §9 + §13.5).
  *
- * For WebP we treat every frame as a keyframe (WebP never embeds
- * inter-frames). The parser reads the frame tag + start code + dimensions
- * uncompressed, then opens a `BoolDecoder` over the first partition and
- * consumes the bool-coded keyframe header per RFC 6386 §9.4-9.10.
+ * Field order for a keyframe:
  *
- * The order of bool-coded fields for a keyframe (per RFC 6386 §9.4ff,
- * cross-checked against libvpx's `vp8/decoder/decodemv.c`):
+ *   1. Frame tag (3 bytes uncompressed): keyframe?, profile,
+ *      show_frame?, partition_length.
+ *   2. Start code (3 bytes uncompressed): 0x9D 0x01 0x2A.
+ *   3. Width/height + scales (4 bytes uncompressed).
+ *   4. Bool-coded first partition begins:
+ *      a. color_space (1 bit)
+ *      b. clamp_type (1 bit)
+ *      c. Segment header (variable)
+ *      d. Filter header (variable, includes simple/level/sharpness/lf-delta)
+ *      e. Partition table (2 bits log2_nparts + size headers if >1)
+ *      f. Quantiser (7 bits + 5 deltas)
+ *      g. update_proba bit (consumed and ignored on keyframes)
+ *      h. Coefficient-probability update loop (4×8×3×11 entries)
+ *      i. mb_no_skip_coef (1 bit) + prob_skip_false (8 bits if set)
  *
- *   1.  color_space (1 bit) — must be 0
- *   2.  clamping_type (1 bit)
- *   3.  segmentation_enabled (1 bit)
- *       (if 1: full update_segmentation header)
- *   4.  filter_type (1 bit)
- *   5.  loop_filter_level (6 bits)
- *   6.  sharpness_level (3 bits)
- *   7.  mb_lf_adjustments (1 bit)
- *       (if 1: full mode_ref_lf_delta_update header)
- *   8.  log2_nparts (2 bits) — 1 << this is the token-partition count
- *   9.  y_ac_qi (7 bits) — base quantiser index
- *  10.  y_dc_delta, y2_dc_delta, y2_ac_delta, uv_dc_delta, uv_ac_delta
- *       (each: 1 flag bit + 5 magnitude+sign bits if set)
- *  11.  refresh_entropy_probs (1 bit)
- *  12.  COEF probability update loop (for each of the 4×8×3×11 entries:
- *       1 flag bit + 8 prob bits if flag set)
- *  13.  mb_no_skip_coef (1 bit)
- *       (if 1: prob_skip_false (8 bits))
- *
- * Inter-frame-only fields (refresh_golden/altref/sign_bias) are NOT
- * present for keyframes.
+ * After this, mode info begins on the same first-partition bool decoder
+ * (one MB at a time, `VP8ParseIntraModeRow`).
  */
 
-export interface VP8Quantiser {
-  yacQi: number
-  ydcDelta: number
-  y2dcDelta: number
-  y2acDelta: number
-  uvdcDelta: number
-  uvacDelta: number
+/** A single segment's quant/filter override. */
+export interface VP8Segment {
+  /** Quantiser override (signed, applied via `absoluteDelta`). */
+  quantiser: number
+  /** Filter strength override (signed, applied via `absoluteDelta`). */
+  filterStrength: number
 }
 
-export interface VP8FilterParams {
-  filterType: number
+export interface VP8SegmentHeader {
+  useSegment: boolean
+  updateMap: boolean
+  /** When true, segment values replace the base; when false, they're added to it. */
+  absoluteDelta: boolean
+  /** Per-segment quantiser/filter overrides (NUM_MB_SEGMENTS = 4 entries). */
+  segments: VP8Segment[]
+  /** Three probabilities used when decoding per-MB segment ids. */
+  segmentTreeProbs: Uint8Array
+}
+
+export interface VP8FilterHeader {
+  /** True when filter_type == 1 (simple), false for the complex filter. */
+  simple: boolean
+  /** Base loop-filter level (post-segment override but pre-mode delta). */
   level: number
   sharpness: number
-  refDeltas: Int8Array
-  modeDeltas: Int8Array
+  /** True if `refLfDelta`/`modeLfDelta` should be applied. */
+  useLfDelta: boolean
+  /** Per-reference-frame loop-filter level deltas (4 entries). */
+  refLfDelta: Int8Array
+  /** Per-mode loop-filter level deltas (4 entries). */
+  modeLfDelta: Int8Array
+  /** Effective filter type: 0 (off), 1 (simple), 2 (complex). */
+  filterType: 0 | 1 | 2
+}
+
+/** Per-segment dequantisation matrices, populated by `VP8ParseQuant`. */
+export interface VP8QuantMatrix {
+  /** [DC, AC] for Y luma blocks. */
+  y1: [number, number]
+  /** [DC, AC] for the Y2 (WHT) block. */
+  y2: [number, number]
+  /** [DC, AC] for U/V chroma blocks. */
+  uv: [number, number]
+  /** Chroma quantiser used for dithering strength (we don't dither). */
+  uvQuant: number
 }
 
 export interface ParsedVP8Header {
   frame: VP8FrameHeader
+  /** Number of token partitions (1, 2, 4, or 8). */
   numPartitions: number
-  /** Byte offset (inside the VP8 chunk) where the residual partitions start. */
+  /** Byte offset (inside the VP8 chunk) where the partition-size table starts. */
   partitionsOffset: number
   colorSpace: number
   clampType: number
-  segmentation: { enabled: boolean }
-  filter: VP8FilterParams
-  quantiser: VP8Quantiser
-  /** Boolean decoder positioned at the macroblock-mode-info area. */
+  segmentation: VP8SegmentHeader
+  filter: VP8FilterHeader
+  /** Per-segment dequantisation matrices (NUM_MB_SEGMENTS = 4 entries). */
+  quant: VP8QuantMatrix[]
+  /** Bool decoder positioned at the macroblock-mode-info area. */
   bool: BoolDecoder
-  /** Probability skipped-block flag, or null if mb_no_skip_coef is 0. */
+  /** Probability of the per-MB skip-coef flag, or null when it isn't coded. */
   probSkipFalse: number | null
   /** Active coefficient-probability table (with any updates applied). */
   coefProbs: Uint8Array
 }
+
+const NUM_MB_SEGMENTS = 4
+const NUM_REF_LF_DELTAS = 4
+const NUM_MODE_LF_DELTAS = 4
+const MB_FEATURE_TREE_PROBS = 3
 
 export function parseVP8Header(data: Uint8Array): ParsedVP8Header {
   if (data.length < 10) {
     throw new Error('VP8: chunk shorter than 10-byte frame header')
   }
 
+  // ── Step 1-3: uncompressed frame tag + start code + dimensions ──────────
   const frameTag = data[0] | (data[1] << 8) | (data[2] << 16)
   const keyframe = (frameTag & 0x01) === 0
   if (!keyframe) {
     throw new Error('VP8: only keyframes are supported (WebP never embeds inter-frames)')
   }
-  const version = (frameTag >> 1) & 0x07
+  const profile = (frameTag >> 1) & 0x07
+  if (profile > 3) {
+    throw new Error(`VP8: unknown profile ${profile}`)
+  }
   const showFrame = ((frameTag >> 4) & 0x01) === 1
+  if (!showFrame) {
+    throw new Error('VP8: frame is not displayable')
+  }
   const firstPartSize = (frameTag >> 5) & 0x7FFFF
 
   if (data[3] !== 0x9D || data[4] !== 0x01 || data[5] !== 0x2A) {
@@ -95,91 +139,64 @@ export function parseVP8Header(data: Uint8Array): ParsedVP8Header {
   const height = heightAndScale & 0x3FFF
   const xScale = widthAndScale >> 14
   const yScale = heightAndScale >> 14
+  if (width === 0 || height === 0) {
+    throw new Error('VP8: zero dimension')
+  }
 
   const partitionStart = 10
   if (partitionStart + firstPartSize > data.length) {
     throw new Error('VP8: declared first-partition size exceeds chunk length')
   }
-  // Bound the first-partition bool decoder by `firstPartSize` so the
-  // header + mode-info reads can't accidentally pull bytes from the
-  // following token partition. libvpx does the same via `buffer_end`.
   const bool = new BoolDecoder(data, partitionStart, firstPartSize)
 
-  const colorSpace = bool.readLiteral(1)
-  const clampType = bool.readLiteral(1)
-  if (colorSpace !== 0) {
-    throw new Error('VP8: unsupported colour space (must be 0 = YUV420)')
-  }
+  // ── Step 4a-b: colour space + clamp type ────────────────────────────────
+  const colorSpace = bool.readBit(0x80)
+  const clampType = bool.readBit(0x80)
 
-  const segmentationEnabled = bool.readLiteral(1) === 1
-  if (segmentationEnabled) {
-    skipSegmentationHeader(bool)
-  }
+  // ── Step 4c: Segment header ─────────────────────────────────────────────
+  const segmentation = parseSegmentHeader(bool)
 
-  const filterType = bool.readLiteral(1)
-  const filterLevel = bool.readLiteral(6)
-  const sharpness = bool.readLiteral(3)
-  const refDeltas = new Int8Array(4)
-  const modeDeltas = new Int8Array(4)
-  const lfAdj = bool.readLiteral(1)
-  if (lfAdj === 1) {
-    const update = bool.readLiteral(1)
-    if (update === 1) {
-      for (let i = 0; i < 4; i++) {
-        if (bool.readLiteral(1) === 1) refDeltas[i] = bool.readSignedLiteral(6)
-      }
-      for (let i = 0; i < 4; i++) {
-        if (bool.readLiteral(1) === 1) modeDeltas[i] = bool.readSignedLiteral(6)
-      }
-    }
-  }
+  // ── Step 4d: Filter header ──────────────────────────────────────────────
+  const filter = parseFilterHeader(bool)
 
+  // ── Step 4e: Partition layout ───────────────────────────────────────────
   const numPartitions = 1 << bool.readLiteral(2)
+  // Token partitions follow the first partition's bytes; the size table
+  // (if numPartitions > 1) is encoded raw at `partitionStart + firstPartSize`.
+  const partitionsOffset = partitionStart + firstPartSize
 
-  // Quantiser indices — y_ac_qi (7 bits) and 5 deltas (1 flag + 4 magnitude
-  // + 1 sign each). Note: spec uses 4-bit magnitude, not 5.
-  const yacQi = bool.readLiteral(7)
-  const ydcDelta = readSignedDelta(bool)
-  const y2dcDelta = readSignedDelta(bool)
-  const y2acDelta = readSignedDelta(bool)
-  const uvdcDelta = readSignedDelta(bool)
-  const uvacDelta = readSignedDelta(bool)
+  // ── Step 4f: Quantiser ─────────────────────────────────────────────────
+  const quant = parseQuant(bool, segmentation)
 
-  // Refresh entropy probs (keyframes still have this — RFC 6386 §9.10).
-  // Followed by the coefficient-probability update loop.
-  bool.readLiteral(1) // refresh_entropy_probs — for keyframes the
-  // saved state always equals the defaults so this flag has no effect
-  // on us; we still consume the bit.
+  // ── Step 4g: update_proba (consumed and ignored — for keyframes the
+  // saved set is always the defaults) ────────────────────────────────────
+  bool.readBit(0x80)
 
+  // ── Step 4h: Coefficient-probability update loop ───────────────────────
   const coefProbs = new Uint8Array(DEFAULT_COEF_PROBS)
-  // Update loop: 4 × 8 × 3 × 11 = 1056 entries, each with a flag bit +
-  // optional 8-bit replacement probability. The decision probability is
-  // a fixed table from the spec.
   for (let i = 0; i < NUM_BLOCK_TYPES; i++) {
     for (let j = 0; j < NUM_COEF_BANDS; j++) {
       for (let k = 0; k < 3; k++) {
         for (let l = 0; l < 11; l++) {
-          if (bool.readBit(COEF_UPDATE_PROBS[i][j][k][l]) === 1) {
-            coefProbs[i * NUM_COEF_BANDS * 3 * 11 + j * 3 * 11 + k * 11 + l] = bool.readLiteral(8)
+          const off = i * NUM_COEF_BANDS * 3 * 11 + j * 3 * 11 + k * 11 + l
+          if (bool.readBit(COEF_UPDATE_PROBS[off]) === 1) {
+            coefProbs[off] = bool.readLiteral(8)
           }
         }
       }
     }
   }
 
-  // mb_no_skip_coef (always present on keyframes per RFC 6386 §9.11).
+  // ── Step 4i: mb_no_skip_coef + prob_skip_false ─────────────────────────
   let probSkipFalse: number | null = null
-  if (bool.readLiteral(1) === 1) {
+  if (bool.readBit(0x80) === 1) {
     probSkipFalse = bool.readLiteral(8)
   }
-
-  // Token partitions follow `firstPartSize`.
-  const partitionsOffset = partitionStart + firstPartSize
 
   return {
     frame: {
       keyframe: true,
-      version,
+      version: profile,
       showFrame,
       firstPartSize,
       width,
@@ -191,230 +208,116 @@ export function parseVP8Header(data: Uint8Array): ParsedVP8Header {
     partitionsOffset,
     colorSpace,
     clampType,
-    segmentation: { enabled: segmentationEnabled },
-    filter: {
-      filterType,
-      level: filterLevel,
-      sharpness,
-      refDeltas,
-      modeDeltas,
-    },
-    quantiser: {
-      yacQi,
-      ydcDelta,
-      y2dcDelta,
-      y2acDelta,
-      uvdcDelta,
-      uvacDelta,
-    },
+    segmentation,
+    filter,
+    quant,
     bool,
     probSkipFalse,
     coefProbs,
   }
 }
 
-function skipSegmentationHeader(bool: BoolDecoder): void {
-  const updateMap = bool.readLiteral(1)
-  const updateData = bool.readLiteral(1)
-  if (updateData === 1) {
-    bool.readLiteral(1) // abs_delta
-    for (let i = 0; i < 4; i++) {
-      if (bool.readLiteral(1) === 1) bool.readSignedLiteral(7)
+// ---------------------------------------------------------------------------
+// Sub-parsers
+// ---------------------------------------------------------------------------
+
+function parseSegmentHeader(bool: BoolDecoder): VP8SegmentHeader {
+  const segments: VP8Segment[] = []
+  for (let i = 0; i < NUM_MB_SEGMENTS; i++) {
+    segments.push({ quantiser: 0, filterStrength: 0 })
+  }
+  const segmentTreeProbs = new Uint8Array(MB_FEATURE_TREE_PROBS)
+  segmentTreeProbs.fill(255)
+
+  const useSegment = bool.readBit(0x80) === 1
+  let updateMap = false
+  let absoluteDelta = true
+  if (useSegment) {
+    updateMap = bool.readBit(0x80) === 1
+    if (bool.readBit(0x80) === 1) {
+      // update segment data
+      absoluteDelta = bool.readBit(0x80) === 1
+      for (let s = 0; s < NUM_MB_SEGMENTS; s++) {
+        segments[s].quantiser = bool.readBit(0x80) === 1 ? bool.readSignedLiteral(7) : 0
+      }
+      for (let s = 0; s < NUM_MB_SEGMENTS; s++) {
+        segments[s].filterStrength = bool.readBit(0x80) === 1 ? bool.readSignedLiteral(6) : 0
+      }
     }
-    for (let i = 0; i < 4; i++) {
-      if (bool.readLiteral(1) === 1) bool.readSignedLiteral(6)
+    if (updateMap) {
+      for (let s = 0; s < MB_FEATURE_TREE_PROBS; s++) {
+        segmentTreeProbs[s] = bool.readBit(0x80) === 1 ? bool.readLiteral(8) : 255
+      }
     }
   }
-  if (updateMap === 1) {
-    for (let i = 0; i < 3; i++) {
-      if (bool.readLiteral(1) === 1) bool.readLiteral(8)
-    }
+  return {
+    useSegment,
+    updateMap,
+    absoluteDelta,
+    segments,
+    segmentTreeProbs,
   }
 }
 
-/** Read an optional 4-bit signed delta (1 flag bit + 4 magnitude bits + sign bit). */
-function readSignedDelta(bool: BoolDecoder): number {
-  return bool.readLiteral(1) === 1 ? bool.readSignedLiteral(4) : 0
+function parseFilterHeader(bool: BoolDecoder): VP8FilterHeader {
+  const simple = bool.readBit(0x80) === 1
+  const level = bool.readLiteral(6)
+  const sharpness = bool.readLiteral(3)
+  const useLfDelta = bool.readBit(0x80) === 1
+  const refLfDelta = new Int8Array(NUM_REF_LF_DELTAS)
+  const modeLfDelta = new Int8Array(NUM_MODE_LF_DELTAS)
+  if (useLfDelta) {
+    if (bool.readBit(0x80) === 1) {
+      // update lf-delta
+      for (let i = 0; i < NUM_REF_LF_DELTAS; i++) {
+        if (bool.readBit(0x80) === 1) refLfDelta[i] = bool.readSignedLiteral(6)
+      }
+      for (let i = 0; i < NUM_MODE_LF_DELTAS; i++) {
+        if (bool.readBit(0x80) === 1) modeLfDelta[i] = bool.readSignedLiteral(6)
+      }
+    }
+  }
+  const filterType: 0 | 1 | 2 = level === 0 ? 0 : simple ? 1 : 2
+  return { simple, level, sharpness, useLfDelta, refLfDelta, modeLfDelta, filterType }
 }
 
-// ---------------------------------------------------------------------------
-// Coef-probability update probabilities — RFC 6386 §13.5 ("k_coef_update_probs")
-// ---------------------------------------------------------------------------
-//
-// 4 × 8 × 3 × 11 table mirroring DEFAULT_COEF_PROBS; the encoder uses
-// these to decide whether to emit a probability update for each entry.
-// In practice cwebp leaves these at 252 (very biased toward "no update")
-// for almost every entry, so the inner loop reads 1056 zero-bits and
-// moves on. We transcribe the spec's table verbatim.
+function parseQuant(bool: BoolDecoder, seg: VP8SegmentHeader): VP8QuantMatrix[] {
+  const baseQ0 = bool.readLiteral(7)
+  const dqy1Dc = bool.readBit(0x80) === 1 ? bool.readSignedLiteral(4) : 0
+  const dqy2Dc = bool.readBit(0x80) === 1 ? bool.readSignedLiteral(4) : 0
+  const dqy2Ac = bool.readBit(0x80) === 1 ? bool.readSignedLiteral(4) : 0
+  const dquvDc = bool.readBit(0x80) === 1 ? bool.readSignedLiteral(4) : 0
+  const dquvAc = bool.readBit(0x80) === 1 ? bool.readSignedLiteral(4) : 0
 
-// eslint-disable-next-line pickier/no-unused-vars
-const COEF_UPDATE_PROBS: ReadonlyArray<ReadonlyArray<ReadonlyArray<ReadonlyArray<number>>>> = [
-  [
-    [
-      [177, 155, 250, 247, 255, 255, 255, 255, 255, 255, 255],
-      [250, 245, 254, 254, 254, 255, 255, 255, 255, 255, 255],
-      [234, 246, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [251, 244, 254, 254, 255, 255, 255, 255, 255, 255, 255],
-      [251, 251, 254, 252, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [254, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [254, 251, 254, 254, 255, 255, 255, 255, 255, 255, 255],
-      [253, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [254, 252, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-      [249, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [254, 252, 254, 254, 255, 255, 255, 255, 255, 255, 255],
-      [255, 252, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [254, 252, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-      [253, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-  ],
-  [
-    [
-      [186, 251, 250, 171, 192, 188, 201, 153, 251, 244, 255],
-      [234, 251, 244, 254, 251, 252, 254, 252, 254, 252, 255],
-      [251, 251, 252, 253, 254, 254, 251, 254, 252, 254, 255],
-    ],
-    [
-      [255, 252, 254, 254, 255, 255, 255, 255, 255, 255, 255],
-      [254, 251, 254, 254, 255, 255, 255, 255, 255, 255, 255],
-      [253, 250, 252, 254, 254, 254, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 254, 253, 254, 254, 255, 255, 255, 255, 255, 255],
-      [255, 252, 253, 254, 254, 255, 255, 255, 255, 255, 255],
-      [255, 251, 253, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [253, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [253, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [253, 252, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-      [254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-  ],
-  [
-    [
-      [248, 255, 255, 228, 247, 255, 255, 255, 255, 255, 255],
-      [255, 253, 255, 254, 254, 255, 255, 255, 255, 255, 255],
-      [255, 250, 255, 254, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-  ],
-  [
-    [
-      [248, 254, 249, 253, 255, 255, 230, 255, 255, 255, 255],
-      [255, 253, 254, 254, 255, 255, 255, 255, 255, 255, 255],
-      [244, 252, 255, 250, 254, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-      [254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-      [253, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-    [
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
-    ],
-  ],
-]
+  const quant: VP8QuantMatrix[] = []
+  for (let i = 0; i < NUM_MB_SEGMENTS; i++) {
+    let q: number
+    if (seg.useSegment) {
+      q = seg.segments[i].quantiser
+      if (!seg.absoluteDelta) q += baseQ0
+    }
+    else {
+      if (i > 0) {
+        // libwebp: reuse segment 0's matrix for non-segmented frames
+        quant.push({
+          y1: [quant[0].y1[0], quant[0].y1[1]],
+          y2: [quant[0].y2[0], quant[0].y2[1]],
+          uv: [quant[0].uv[0], quant[0].uv[1]],
+          uvQuant: quant[0].uvQuant,
+        })
+        continue
+      }
+      q = baseQ0
+    }
+    const y1Dc = DC_QUANT[clampQi(q + dqy1Dc)]
+    const y1Ac = AC_QUANT[clampQi(q)]
+    const y2Dc = DC_QUANT[clampQi(q + dqy2Dc)] * 2
+    let y2Ac = (AC_QUANT[clampQi(q + dqy2Ac)] * 101581) >> 16
+    if (y2Ac < 8) y2Ac = 8
+    const uvDcIdx = q + dquvDc
+    const uvDc = DC_QUANT[uvDcIdx < 0 ? 0 : uvDcIdx > 117 ? 117 : uvDcIdx]
+    const uvAc = AC_QUANT[clampQi(q + dquvAc)]
+    quant.push({ y1: [y1Dc, y1Ac], y2: [y2Dc, y2Ac], uv: [uvDc, uvAc], uvQuant: q + dquvAc })
+  }
+  return quant
+}

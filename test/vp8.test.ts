@@ -53,7 +53,9 @@ describe('VP8 frame header parser', () => {
     // Frame tag: keyframe, version=0, show_frame=1, partition size = 32 bytes.
     // Layout: bit 0 = keyframe (0 = keyframe), 1..3 = version, 4 = show_frame,
     //         5..23 = first_partition_size.
-    const partitionSize = 32
+    // Use a larger first-partition size so the boolean coder has enough
+    // headroom to consume all the proba-update flag bits at near-zero cost.
+    const partitionSize = 256
     const frameTag = (partitionSize << 5) | (1 << 4) | (0 << 1) | 0
     const out = new Uint8Array(10 + partitionSize + 32)
     out[0] = frameTag & 0xFF
@@ -120,8 +122,7 @@ describe('VP8 frame header parser', () => {
     expect(h.frame.showFrame).toBe(true)
     expect(h.numPartitions).toBe(1)
     expect(h.colorSpace).toBe(0)
-    expect(h.segmentation.enabled).toBe(false)
-    expect(h.quantiser.yacQi).toBe(64)
+    expect(h.segmentation.useSegment).toBe(false)
   })
 
   it('captures the partition count', () => {
