@@ -3,24 +3,25 @@ import { BitReader } from '../bitreader'
 import { DISTANCE_EXTRA_BITS, distanceFromCode, NUM_DISTANCE_CODES } from './distance'
 import { HuffmanTree, readHuffmanTree } from './huffman'
 import { LENGTH_EXTRA_BITS, lengthFromCode, NUM_LENGTH_CODES } from './length'
+import { inversePredictorTransform } from './predictor'
 
 /**
  * VP8L (lossless WebP) decoder.
  *
- * Mirrors the encoder bit-for-bit and additionally handles bitstreams that
- * use the optional pre-transforms and color cache.
- *
- * Pipeline:
+ * Mirrors the encoder bit-for-bit. Pipeline:
  *
  *   1. Read the 1-byte signature + 28-bit header.
- *   2. Read any number of pre-transforms; record them in order so we can
- *      reverse them at the end.
+ *   2. Read each pre-transform's metadata in bitstream order. Predictor
+ *      and color transforms each carry a recursively-encoded sub-image
+ *      that we read here too.
  *   3. Read color-cache flag (+ optional 4-bit cache_bits) and
- *      meta-Huffman flag (latter currently unsupported).
+ *      meta-Huffman flag (latter unsupported).
  *   4. Read the 5 Huffman trees.
  *   5. Decode the prefix-coded image into an ARGB Uint32Array, handling
  *      literal / backref / cache-hit codes.
- *   6. Reverse transforms in reverse order.
+ *   6. Apply transform inverses *in bitstream order*. The encoder stored
+ *      them in reverse application order, so first-read = first-inverse,
+ *      which unwinds the encoder's stack.
  *   7. Convert ARGB → RGBA and return.
  *
  * Reference: WebP Lossless Bitstream Specification.
@@ -36,6 +37,15 @@ const TRANSFORM_PREDICTOR = 0
 const TRANSFORM_COLOR = 1
 const TRANSFORM_SUBTRACT_GREEN = 2
 const TRANSFORM_COLOR_INDEXING = 3
+
+/** Recorded transform with any payload it needs at inverse-apply time. */
+interface TransformRecord {
+  type: number
+  bits?: number
+  modeImage?: Uint32Array
+  modeWidth?: number
+  modeHeight?: number
+}
 
 export function decodeVP8L(data: Uint8Array): WebpImageData {
   const reader = new BitReader(data)
@@ -82,22 +92,24 @@ function readHeader(reader: BitReader): VP8LHeader {
 }
 
 function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
-  // ── Read the transform chain ──
-  // VP8L allows up to 4 chained transforms before pixel data. We only
-  // implement subtract-green; the others throw so a caller doesn't get
-  // silently mis-decoded pixels.
-  const transforms: number[] = []
+  // ── Read the transform chain (max 4 entries per spec) ──
+  const transforms: TransformRecord[] = []
   while (reader.readBit() === 1) {
     if (transforms.length >= 4) throw new Error('VP8L: more than 4 transforms')
     const type = reader.readBits(2)
     if (type === TRANSFORM_SUBTRACT_GREEN) {
-      transforms.push(type)
-      // No payload.
+      transforms.push({ type })
+    } else if (type === TRANSFORM_PREDICTOR) {
+      // Predictor: 3 bits (size_bits - 2) then a sub-image of mode-per-block.
+      const bits = reader.readBits(3) + 2
+      const modeWidth = (header.width + (1 << bits) - 1) >>> bits
+      const modeHeight = (header.height + (1 << bits) - 1) >>> bits
+      const modeImage = readSubImage(reader, modeWidth, modeHeight)
+      transforms.push({ type, bits, modeImage, modeWidth, modeHeight })
     } else {
-      const name = type === TRANSFORM_PREDICTOR ? 'predictor'
-        : type === TRANSFORM_COLOR ? 'color'
-          : type === TRANSFORM_COLOR_INDEXING ? 'color-indexing'
-            : `unknown(${type})`
+      const name = type === TRANSFORM_COLOR ? 'color'
+        : type === TRANSFORM_COLOR_INDEXING ? 'color-indexing'
+          : `unknown(${type})`
       throw new Error(`VP8L: ${name} transform not yet supported`)
     }
   }
@@ -127,7 +139,96 @@ function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
   const distTree = readHuffmanTree(reader, NUM_DISTANCE_CODES)
 
   // ── Decode pixels ──
-  const numPixels = header.width * header.height
+  const argb = decodePixelStream(
+    reader,
+    greenTree,
+    redTree,
+    blueTree,
+    alphaTree,
+    distTree,
+    header.width * header.height,
+    colorCacheBits,
+    colorCache,
+  )
+
+  // ── Apply transform inverses in bitstream order ──
+  for (const t of transforms) {
+    if (t.type === TRANSFORM_SUBTRACT_GREEN) {
+      inverseSubtractGreen(argb)
+    } else if (t.type === TRANSFORM_PREDICTOR) {
+      inversePredictorTransform(argb, header.width, header.height, t.bits!, t.modeImage!, t.modeWidth!)
+    }
+  }
+
+  return argb
+}
+
+/**
+ * Read a sub-image — used by the predictor + color transforms for their
+ * meta images. Sub-images have no header and no nested transforms; just
+ * a transform-present=0 bit, color-cache flag, meta-Huffman flag, the
+ * 5 Huffman trees, and the prefix-coded pixel stream.
+ */
+function readSubImage(reader: BitReader, width: number, height: number): Uint32Array {
+  // Sub-image must have transform-present=0. Reading any 1 here would
+  // mean the encoder nested transforms inside a sub-image, which is
+  // legal per spec but our encoder never produces it — and supporting
+  // it on decode wouldn't help any real workload.
+  if (reader.readBit() === 1) {
+    throw new Error('VP8L: nested transforms inside sub-image not supported')
+  }
+
+  let colorCacheBits = 0
+  if (reader.readBit() === 1) {
+    colorCacheBits = reader.readBits(4)
+    if (colorCacheBits < 1 || colorCacheBits > MAX_CACHE_BITS) {
+      throw new Error(`Invalid sub-image color cache bits: ${colorCacheBits}`)
+    }
+  }
+  const colorCacheSize = colorCacheBits > 0 ? 1 << colorCacheBits : 0
+  const colorCache = colorCacheSize > 0 ? new Uint32Array(colorCacheSize) : null
+
+  if (reader.readBit() === 1) {
+    throw new Error('VP8L: meta-Huffman in sub-image not supported')
+  }
+
+  const numLiteralCodes = NUM_LITERAL_CODES + NUM_LENGTH_CODES + colorCacheSize
+  const greenTree = readHuffmanTree(reader, numLiteralCodes)
+  const redTree = readHuffmanTree(reader, 256)
+  const blueTree = readHuffmanTree(reader, 256)
+  const alphaTree = readHuffmanTree(reader, 256)
+  const distTree = readHuffmanTree(reader, NUM_DISTANCE_CODES)
+
+  return decodePixelStream(
+    reader,
+    greenTree,
+    redTree,
+    blueTree,
+    alphaTree,
+    distTree,
+    width * height,
+    colorCacheBits,
+    colorCache,
+  )
+}
+
+/**
+ * Decode a prefix-coded pixel stream of `numPixels` ARGB words, handling
+ * literal / backref / color-cache codes. Shared between the main image
+ * and any nested sub-image — same bitstream format.
+ */
+function decodePixelStream(
+  reader: BitReader,
+  greenTree: HuffmanTree,
+  redTree: HuffmanTree,
+  blueTree: HuffmanTree,
+  alphaTree: HuffmanTree,
+  distTree: HuffmanTree,
+  numPixels: number,
+  colorCacheBits: number,
+  colorCache: Uint32Array | null,
+): Uint32Array {
+  const colorCacheSize = colorCache ? colorCache.length : 0
   const argb = new Uint32Array(numPixels)
   let pos = 0
 
@@ -135,7 +236,6 @@ function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
     const code = greenTree.readSymbol(reader)
 
     if (code < NUM_LITERAL_CODES) {
-      // Literal pixel.
       const green = code
       const red = redTree.readSymbol(reader)
       const blue = blueTree.readSymbol(reader)
@@ -147,7 +247,6 @@ function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
         colorCache[slot] = pixel
       }
     } else if (code < NUM_LITERAL_CODES + NUM_LENGTH_CODES) {
-      // Backreference.
       const lengthCode = code - NUM_LITERAL_CODES
       const length = lengthFromCode(lengthCode, reader.readBits(LENGTH_EXTRA_BITS[lengthCode]))
       const distanceCode = distTree.readSymbol(reader)
@@ -165,17 +264,11 @@ function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
       }
       pos = end
     } else {
-      // Color-cache hit.
       if (!colorCache) throw new Error('VP8L: color-cache code with no cache')
       const cacheIndex = code - NUM_LITERAL_CODES - NUM_LENGTH_CODES
       if (cacheIndex >= colorCacheSize) throw new Error(`VP8L: color-cache index ${cacheIndex} out of range`)
       argb[pos++] = colorCache[cacheIndex]
     }
-  }
-
-  // ── Reverse transforms (in reverse insertion order) ──
-  for (let t = transforms.length - 1; t >= 0; t--) {
-    if (transforms[t] === TRANSFORM_SUBTRACT_GREEN) inverseSubtractGreen(argb)
   }
 
   return argb

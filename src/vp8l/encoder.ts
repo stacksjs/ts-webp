@@ -3,6 +3,7 @@ import { BitWriter } from '../bitreader'
 import { distanceToCode, NUM_DISTANCE_CODES } from './distance'
 import { buildCodeLengths, lengthsToCodes, reverseBits, writeHuffmanTree } from './huffman'
 import { lengthToCode, MAX_LENGTH, NUM_LENGTH_CODES } from './length'
+import { applyPredictorTransform } from './predictor'
 
 /**
  * VP8L (lossless WebP) encoder.
@@ -38,6 +39,8 @@ const NUM_LITERAL_CODES = 256
 /** Total green/length symbols *before* color-cache codes are appended. */
 const GREEN_BASE = NUM_LITERAL_CODES + NUM_LENGTH_CODES
 
+/** Transform type 0 = predictor (3-bit size_bits + recursive sub-image). */
+const TRANSFORM_PREDICTOR = 0
 /** Transform type 2 = subtract-green (no payload). */
 const TRANSFORM_SUBTRACT_GREEN = 2
 
@@ -61,6 +64,9 @@ enum TokenKind {
  */
 interface InternalOptions {
   subtractGreen: boolean
+  predictor: boolean
+  /** Block size as `1 << predictorBits`. Spec range: 2..7 (block 4..128). */
+  predictorBits: number
   useLZ77: boolean
   useColorCache: boolean
   cacheBits: number
@@ -70,6 +76,11 @@ function resolveOptions(opts: WebpEncodeOptions): InternalOptions {
   const o = opts as WebpEncodeOptions & Partial<InternalOptions>
   return {
     subtractGreen: o.subtractGreen ?? true,
+    // Predictor: enabled by default. The encoder's all-blocks-mode-11
+    // strategy gets us most of the available win at one extra pixel pass
+    // and a handful of extra bits in the bitstream.
+    predictor: o.predictor ?? true,
+    predictorBits: o.predictorBits ?? 4,
     useLZ77: o.useLZ77 ?? true,
     useColorCache: o.useColorCache ?? true,
     cacheBits: o.cacheBits ?? DEFAULT_CACHE_BITS,
@@ -95,8 +106,22 @@ export function encodeVP8L(
     argb[i] = (data[o + 3] << 24) | (data[o] << 16) | (data[o + 1] << 8) | data[o + 2]
   }
 
-  // ── Step 2: subtract-green ──
+  // ── Step 2: pre-transforms (applied innermost-to-outermost) ──
+  // Spec ordering: encoder applies SG first, then predictor; the
+  // bitstream stores them in REVERSE — predictor metadata before SG —
+  // so the decoder reads them in inverse-application order. Applying SG
+  // first means the predictor operates on already-shifted channels,
+  // which generally helps because SG decorrelates colour planes and
+  // makes neighbour predictions tighter.
   if (opts.subtractGreen) applySubtractGreen(argb)
+  let predictorInfo: { modeImage: Uint32Array, modeWidth: number, modeHeight: number } | null = null
+  if (opts.predictor && width >= 2 && height >= 2) {
+    // Predictor needs at least 2×2 pixels — for smaller images the
+    // mode image would have zero blocks, which is degenerate. Skip
+    // the transform on tiny inputs; their compression overhead would
+    // outweigh any savings anyway.
+    predictorInfo = applyPredictorTransform(argb, width, height, opts.predictorBits)
+  }
 
   // ── Step 3: tokenize ──
   // Worst case = one token per pixel (all literals). We allocate parallel
@@ -165,6 +190,16 @@ export function encodeVP8L(
   writer.writeBit(imageData.hasAlpha ? 1 : 0)
   writer.writeBits(0, 3) // version
 
+  // Bitstream transform order is REVERSE of application order. The
+  // last-applied transform is read first by the decoder so its inverse
+  // is applied first. Encoder applied: SG, then predictor. Bitstream
+  // emits: predictor-meta, then SG-meta.
+  if (predictorInfo) {
+    writer.writeBit(1) // transform-present
+    writer.writeBits(TRANSFORM_PREDICTOR, 2)
+    writer.writeBits(opts.predictorBits - 2, 3)
+    writeSubImage(writer, predictorInfo.modeImage, predictorInfo.modeWidth, predictorInfo.modeHeight)
+  }
   if (opts.subtractGreen) {
     writer.writeBit(1) // transform-present
     writer.writeBits(TRANSFORM_SUBTRACT_GREEN, 2)
@@ -391,4 +426,82 @@ function sum(arr: Uint32Array): number {
   let s = 0
   for (let i = 0; i < arr.length; i++) s += arr[i]
   return s
+}
+
+// ---------------------------------------------------------------------------
+// Sub-image emit (for predictor mode images and color-transform images)
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit a small ARGB image as a VP8L "entropy image" — the same format
+ * VP8L uses for the main image, but without the outer signature/header,
+ * without nested transforms, and (in our implementation) without LZ77
+ * or color cache. Just five Huffman trees over the per-channel literals
+ * plus literal-only pixel data.
+ *
+ * Used for the mode-per-block image of the predictor transform and the
+ * color-transform image. Both are tiny (typically a few hundred pixels)
+ * with a small set of distinct values, so literal-only encoding plus
+ * Huffman is already near-optimal — adding LZ77 here would cost more
+ * bitstream overhead than it'd save.
+ */
+function writeSubImage(writer: BitWriter, argb: Uint32Array, width: number, height: number): void {
+  // Sub-image header: no transforms, no color cache, no meta-Huffman.
+  writer.writeBit(0) // transform-present = 0 (no nested transforms)
+  writer.writeBit(0) // color-cache present = 0
+  writer.writeBit(0) // meta-Huffman = 0
+
+  const numPixels = width * height
+  const greenFreq = new Uint32Array(GREEN_BASE)
+  const redFreq = new Uint32Array(256)
+  const blueFreq = new Uint32Array(256)
+  const alphaFreq = new Uint32Array(256)
+  // Distance tree must still be present even though we emit no backrefs.
+  // Pin one symbol so it gets a well-formed (length-1) tree.
+  const distFreq = new Uint32Array(NUM_DISTANCE_CODES)
+  distFreq[0] = 1
+
+  for (let i = 0; i < numPixels; i++) {
+    const px = argb[i]
+    alphaFreq[(px >>> 24) & 0xFF]++
+    redFreq[(px >>> 16) & 0xFF]++
+    greenFreq[(px >>> 8) & 0xFF]++
+    blueFreq[px & 0xFF]++
+  }
+
+  // Each tree must have ≥ 1 non-zero symbol (else simple-code path can't
+  // fire). Empty channels get a placeholder so tree construction works.
+  if (sum(redFreq) === 0) redFreq[0] = 1
+  if (sum(blueFreq) === 0) blueFreq[0] = 1
+  if (sum(alphaFreq) === 0) alphaFreq[0] = 1
+  if (sum(greenFreq) === 0) greenFreq[0] = 1
+
+  const greenLen = buildCodeLengths(greenFreq)
+  const redLen = buildCodeLengths(redFreq)
+  const blueLen = buildCodeLengths(blueFreq)
+  const alphaLen = buildCodeLengths(alphaFreq)
+  const distLen = buildCodeLengths(distFreq)
+
+  writeHuffmanTree(writer, greenLen)
+  writeHuffmanTree(writer, redLen)
+  writeHuffmanTree(writer, blueLen)
+  writeHuffmanTree(writer, alphaLen)
+  writeHuffmanTree(writer, distLen)
+
+  const greenCodes = lengthsToCodes(greenLen)
+  const redCodes = lengthsToCodes(redLen)
+  const blueCodes = lengthsToCodes(blueLen)
+  const alphaCodes = lengthsToCodes(alphaLen)
+
+  for (let i = 0; i < numPixels; i++) {
+    const px = argb[i]
+    const a = (px >>> 24) & 0xFF
+    const r = (px >>> 16) & 0xFF
+    const g = (px >>> 8) & 0xFF
+    const b = px & 0xFF
+    emitSymbol(writer, greenLen[g], greenCodes[g])
+    emitSymbol(writer, redLen[r], redCodes[r])
+    emitSymbol(writer, blueLen[b], blueCodes[b])
+    emitSymbol(writer, alphaLen[a], alphaCodes[a])
+  }
 }
