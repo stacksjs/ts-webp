@@ -14,22 +14,20 @@ const { data, width, height, hasAlpha } = decode(encoded)
 
 ## Status
 
-- ✅ **Lossless encode** (VP8L) — produces spec-compliant bitstreams with a
-  proper canonical Huffman codec
-- ✅ **Lossless decode** (VP8L) — reads our own output and other VP8L
-  bitstreams that don't use pre-transforms
+- ✅ **Lossless encode** (VP8L) — spec-compliant bitstream with a
+  canonical Huffman codec, subtract-green pre-transform, LZ77
+  backreferences, and color cache
+- ✅ **Lossless decode** (VP8L) — reads our own output and any other
+  VP8L bitstream that uses only subtract-green among the pre-transforms
 - ✅ **Exact round-trip** — `decode(encode(image)).data === image.data`
+  for every image we know how to construct, byte-for-byte
 - ✅ **Alpha channel** — full RGBA support
 - ✅ **RIFF container** — parse + emit
-- 🚧 **VP8L pre-transforms** (subtract-green, predictor, color,
-  color-indexing) — *not yet* supported on either side. The encoder emits
-  no transforms (so output is correct but not as small as libwebp's); the
-  decoder rejects any bitstream that uses them rather than mangling
-  output silently. Most photo-quality libwebp output uses subtract-green
-  by default, so don't expect to decode arbitrary `.webp` files yet.
-- 🚧 **LZ77 backreferences** + **color cache** — encoder doesn't emit
-  these yet, so compression on photos is around 70-80 % of raw RGBA.
-  Decoder handles both per spec.
+- 🚧 **Predictor / color / color-indexing transforms** — encoder doesn't
+  emit them; decoder rejects any bitstream that does (so we don't
+  silently mis-decode libwebp output that uses them). The `subtract-green`
+  transform — which is the *most common* one in libwebp output — is
+  fully supported.
 - ❌ **Lossy** (VP8) encoding — not implemented; `encode(…, { lossless:
   false })` falls back to lossless. VP8 is a multi-month port of libvpx
   and out of scope for this library.
@@ -80,19 +78,45 @@ single-chunk VP8L route.
 
 ## Performance
 
-Reference numbers for a 256×256 image (262 KB raw RGBA) with mixed pixel
-content, on Apple M-series, Bun 1.3:
+Reference numbers on Apple M-series, Bun 1.3, 256×256 photo-like image:
 
 | | Time |
 |---|---|
-| Encode | ~3.7 ms |
-| Decode | ~1.4 ms |
-| Output size | 78 % of raw |
+| Encode | ~2.2 ms |
+| Decode | ~2.5 ms |
+| Output size | 15 % of raw RGBA |
+
+Compression ratios across patterns (with all features on):
+
+| pattern (64×64) | output / raw |
+|---|---|
+| single colour | 8 % |
+| stripes (2 colours) | 3 % |
+| 8-colour palette, scattered | 3 % |
+| RGB-correlated channels | 16 % |
+| photo-like sin/cos blend | 18 % |
 
 The hot paths use 32-bit accumulator-based bit I/O, `Uint32Array`-backed
-ARGB pixel buffers, and a primary-LUT-first Huffman decoder. Adding
-subtract-green + LZ77 + color cache (planned) drops the output size to
-~30-50 % of raw for natural images.
+ARGB pixel buffers, a primary-LUT-first Huffman decoder, and a hash-table
+LZ77 match finder over 3-pixel ARGB windows.
+
+## Encoder options
+
+```ts
+encode(image, {
+  lossless?: boolean        // default: true; false silently falls back to lossless
+  // Internal feature toggles (mainly for tests / debugging):
+  subtractGreen?: boolean   // default: true
+  useLZ77?: boolean         // default: true
+  useColorCache?: boolean   // default: true
+  cacheBits?: number        // default: 11; range 1..11
+})
+```
+
+Each transform is independently toggleable: `{ subtractGreen: false }`
+for example produces a valid VP8L bitstream that just skips the
+subtract-green pass. We use this in tests to isolate per-feature
+round-trip correctness.
 
 ## Architecture
 

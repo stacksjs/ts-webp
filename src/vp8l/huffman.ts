@@ -32,87 +32,154 @@ const MAX_CODE_LENGTH = 15
 
 /**
  * Build canonical Huffman code lengths from per-symbol frequencies, with
- * lengths capped at `maxBits`. Uses package-merge to honour the cap; the
- * cap matters because VP8L disallows codes longer than 15 bits.
+ * lengths capped at `maxBits`. Uses a textbook two-step:
+ *
+ *   1. Build a *standard* (uncapped) Huffman tree via min-heap merging.
+ *      This gives the optimal lengths if no cap were imposed.
+ *   2. If any length exceeds `maxBits`, run zlib-style "bit-length
+ *      fix-up": iteratively shorten the deepest nodes and lengthen the
+ *      shallowest until every length fits and Kraft's inequality holds.
  *
  * Returns a `Uint8Array` of length `freq.length` where `lengths[s]` is the
  * number of bits assigned to symbol `s`, or 0 if `freq[s] === 0`.
+ *
+ * The earlier package-merge implementation was elegant on paper but
+ * subtly miscomputed lengths for sparse distributions in a way that
+ * violated Kraft's inequality (sum 2^-len > 1) — and that produced
+ * decoder bitstreams the meta-Huffman tree couldn't parse. Standard
+ * Huffman + length fix-up is what zlib, deflate, and libwebp use, and
+ * it's known correct.
  */
 export function buildCodeLengths(freq: Uint32Array | number[], maxBits = MAX_CODE_LENGTH): Uint8Array {
   const n = freq.length
   const lengths = new Uint8Array(n)
 
-  // Collect non-zero symbols.
-  const symbols: { sym: number, w: number }[] = []
+  type Node = { weight: number, sym: number, left?: Node, right?: Node }
+  const heap: Node[] = []
   for (let s = 0; s < n; s++) {
     const w = (freq as ArrayLike<number>)[s]
-    if (w > 0) symbols.push({ sym: s, w })
+    if (w > 0) heap.push({ weight: w, sym: s })
   }
 
-  if (symbols.length === 0) return lengths
-  // A single-symbol code still gets length 1 — VP8L's "simple code" path can
-  // store this even more efficiently, but a length-1 normal tree also works.
-  if (symbols.length === 1) {
-    lengths[symbols[0].sym] = 1
+  if (heap.length === 0) return lengths
+  if (heap.length === 1) {
+    lengths[heap[0].sym] = 1
     return lengths
   }
 
-  // Package-merge gives the optimal length-limited prefix code. The simpler
-  // "build full Huffman tree, then if any depth > maxBits fall back to flat"
-  // approach can produce sub-optimal codes for skewed distributions; our
-  // tests check round-trip but not output size, so technically we could be
-  // lazy here — but package-merge is short and gets us materially better
-  // compression on real images at no real cost.
-  symbols.sort((a, b) => a.w - b.w || a.sym - b.sym)
-
-  const m = symbols.length
-  // Each "package" is (weight, set-of-symbols-it-contributes-to). We
-  // represent the set as a packed bitfield since m ≤ 280 in our usage and
-  // a pair of `BigInt`s would dominate cost. Instead, track per-symbol
-  // counters: `count[s]` is how many "leaves" of weight `freq[s]` are
-  // packed in across rounds. Length of `s` = `count[s]`.
-  const count = new Uint32Array(m)
-
-  // Round k: merge sorted packages from round k+1 plus the original leaves
-  // pairwise; each merge increments `count` for every original leaf in the
-  // package. We do this lazily by tracking each package as the multiset of
-  // its leaves; cheap enough at our scale.
-  type Pkg = { w: number, leaves: Uint16Array }
-  let prev: Pkg[] = symbols.map((s, i) => ({
-    w: s.w,
-    leaves: new Uint16Array([i]),
-  }))
-
-  for (let k = 0; k < maxBits; k++) {
-    // Pair up `prev` into packages of two.
-    const paired: Pkg[] = []
-    for (let i = 0; i + 1 < prev.length; i += 2) {
-      const a = prev[i]
-      const b = prev[i + 1]
-      const merged = new Uint16Array(a.leaves.length + b.leaves.length)
-      merged.set(a.leaves, 0)
-      merged.set(b.leaves, a.leaves.length)
-      paired.push({ w: a.w + b.w, leaves: merged })
+  // Sort ascending. We use sorted-insert instead of a real heap because n
+  // is small (≤ 2328 for VP8L) and `Array.splice` is fine at that scale.
+  heap.sort((a, b) => a.weight - b.weight)
+  while (heap.length > 1) {
+    const a = heap.shift()!
+    const b = heap.shift()!
+    const m: Node = { weight: a.weight + b.weight, sym: -1, left: a, right: b }
+    // Binary-insert m to keep the array sorted.
+    let lo = 0
+    let hi = heap.length
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1
+      if (heap[mid].weight <= m.weight) lo = mid + 1
+      else hi = mid
     }
-    // Merge with the original leaves and re-sort.
-    const next: Pkg[] = paired.slice()
-    for (let i = 0; i < m; i++) {
-      next.push({ w: symbols[i].w, leaves: new Uint16Array([i]) })
-    }
-    next.sort((x, y) => x.w - y.w)
-    prev = next
+    heap.splice(lo, 0, m)
   }
 
-  // Take the smallest 2m − 2 packages from the final round; each leaf of
-  // each chosen package contributes 1 to `count[leaf]`.
-  const take = 2 * m - 2
-  for (let i = 0; i < take && i < prev.length; i++) {
-    const leaves = prev[i].leaves
-    for (let j = 0; j < leaves.length; j++) count[leaves[j]]++
+  // Walk the tree to assign per-symbol lengths.
+  // Iterative walk to avoid stack overflow on deeply unbalanced trees.
+  type Frame = { node: Node, depth: number }
+  const stack: Frame[] = [{ node: heap[0], depth: 0 }]
+  while (stack.length > 0) {
+    const f = stack.pop()!
+    if (f.node.sym >= 0) {
+      // Single-leaf tree (only one symbol with non-zero freq) gets depth 0
+      // from the walk; force it to 1 so we always emit at least one bit.
+      lengths[f.node.sym] = Math.max(f.depth, 1)
+    } else {
+      stack.push({ node: f.node.left!, depth: f.depth + 1 })
+      stack.push({ node: f.node.right!, depth: f.depth + 1 })
+    }
   }
 
-  // Map back to original symbols.
-  for (let i = 0; i < m; i++) lengths[symbols[i].sym] = Math.min(count[i] || 1, maxBits)
+  // ── Length-limit fix-up ──
+  // Find max length; if within the cap, we're done.
+  let maxLen = 0
+  for (let s = 0; s < n; s++) if (lengths[s] > maxLen) maxLen = lengths[s]
+  if (maxLen <= maxBits) return lengths
+
+  // Cap every length at maxBits, then redistribute to restore Kraft.
+  // The classic algorithm: count how many entries are at each length,
+  // overflow-aware, and shuffle bits up until Kraft's inequality holds
+  // (in integer form: ∑ 2^(maxBits - lengths[s]) ≤ 2^maxBits).
+  const lenCount = new Uint32Array(maxBits + 2)
+  for (let s = 0; s < n; s++) {
+    if (lengths[s] > 0) {
+      const capped = lengths[s] > maxBits ? maxBits : lengths[s]
+      lenCount[capped]++
+    }
+  }
+
+  // Compute Kraft excess in fixed-point with denominator 2^maxBits.
+  // After capping, every code at length L contributes 2^(maxBits - L).
+  // The total must equal 2^maxBits exactly for a valid prefix code.
+  let kraftSum = 0
+  for (let L = 1; L <= maxBits; L++) kraftSum += lenCount[L] * (1 << (maxBits - L))
+
+  const KRAFT_TARGET = 1 << maxBits
+
+  // While the sum overshoots (Kraft > 1 in real form), lengthen something.
+  // We lengthen the *shortest* available code (highest contribution to
+  // overshoot per unit lengthening), which aligns with the standard fix-up.
+  while (kraftSum > KRAFT_TARGET) {
+    // Find the smallest length L where we can lengthen one entry.
+    // We need an entry at depth L that we can move to L+1 (and L+1 < maxBits
+    // so we don't immediately violate the cap again).
+    let L = maxBits - 1
+    while (L > 0 && lenCount[L] === 0) L--
+    if (L === 0) break // Shouldn't happen if input is sane.
+    lenCount[L]--
+    lenCount[L + 1]++
+    kraftSum -= 1 << (maxBits - L - 1) // moving from L to L+1 halves contribution
+  }
+
+  // Conversely, the sum could undershoot if we capped a long code — Kraft
+  // < 1 means we have spare encoding capacity, which is fine for a prefix
+  // code but wastes bits on the wire. Promote the longest entries by 1
+  // until we use every bit. (This step is what makes the resulting code
+  // *canonical*.)
+  while (kraftSum < KRAFT_TARGET) {
+    // Find the longest non-empty length and shorten one of its entries.
+    let L = maxBits
+    while (L > 0 && lenCount[L] === 0) L--
+    if (L <= 1) break
+    lenCount[L]--
+    lenCount[L - 1]++
+    kraftSum += 1 << (maxBits - L) // moving from L to L-1 doubles contribution
+  }
+
+  // Re-assign per-symbol lengths from the histogram, picking the heaviest
+  // symbols to take the shortest codes (canonical assignment).
+  const sortedSyms = Array.from({ length: n }, (_, s) => s)
+    .filter(s => lengths[s] > 0)
+    .sort((a, b) => {
+      const fa = (freq as ArrayLike<number>)[a]
+      const fb = (freq as ArrayLike<number>)[b]
+      return fb - fa // heaviest first
+    })
+
+  // Walk lengths from shortest to longest, assigning the count for each.
+  let symIdx = 0
+  for (let L = 1; L <= maxBits; L++) {
+    let remaining = lenCount[L]
+    while (remaining > 0 && symIdx < sortedSyms.length) {
+      lengths[sortedSyms[symIdx++]] = L
+      remaining--
+    }
+  }
+  // Any symbols left after we exhaust lenCount have length 0 — shouldn't
+  // happen for non-zero-freq symbols, but defensively zero them out so the
+  // canonical-code assignment doesn't see stale data.
+  while (symIdx < sortedSyms.length) lengths[sortedSyms[symIdx++]] = 0
 
   return lengths
 }
