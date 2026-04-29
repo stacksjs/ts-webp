@@ -13,6 +13,8 @@ import { decode, encode } from '../src'
 
 type Variant = {
   subtractGreen?: boolean
+  predictor?: boolean
+  useColorIndex?: boolean
   useLZ77?: boolean
   useColorCache?: boolean
   cacheBits?: number
@@ -47,8 +49,25 @@ function expectRoundTrip(image: { data: Uint8Array, width: number, height: numbe
   return encoded.length
 }
 
-const NO_FEATURES: Variant = { subtractGreen: false, useLZ77: false, useColorCache: false }
-const ALL_FEATURES: Variant = { subtractGreen: true, useLZ77: true, useColorCache: true }
+// "No features" disables every transform AND every pixel-stream
+// optimization, so per-feature win tests can attribute compression
+// gains to exactly the toggle they vary. Color-indexing is the
+// stickiest of these — it pre-empts SG and predictor when ≤ 256
+// distinct colours are present, which is most synthetic test images.
+const NO_FEATURES: Variant = {
+  subtractGreen: false,
+  predictor: false,
+  useColorIndex: false,
+  useLZ77: false,
+  useColorCache: false,
+}
+const ALL_FEATURES: Variant = {
+  subtractGreen: true,
+  predictor: true,
+  useColorIndex: true,
+  useLZ77: true,
+  useColorCache: true,
+}
 
 describe('encoder feature toggles — exact round-trip', () => {
   // Each toggle on its own + every pair + all three. We don't stress
@@ -93,7 +112,7 @@ describe('compression — features should win on the right images', () => {
   it('LZ77 wins big on long single-colour runs', () => {
     const img = makeImage(64, 64, () => [128, 128, 128, 255])
     const baseline = expectRoundTrip(img, NO_FEATURES)
-    const withLz77 = expectRoundTrip(img, { useLZ77: true, subtractGreen: false, useColorCache: false })
+    const withLz77 = expectRoundTrip(img, { ...NO_FEATURES, useLZ77: true })
     // Single-colour image should compress to a tiny fraction with LZ77.
     expect(withLz77).toBeLessThan(baseline / 5)
   })
@@ -104,7 +123,7 @@ describe('compression — features should win on the right images', () => {
       return [(base + 5) % 256, base, (base + 251) % 256, 255]
     })
     const baseline = expectRoundTrip(img, NO_FEATURES)
-    const withSg = expectRoundTrip(img, { subtractGreen: true, useLZ77: false, useColorCache: false })
+    const withSg = expectRoundTrip(img, { ...NO_FEATURES, subtractGreen: true })
     // Correlated channels: SG should at least roughly halve the literal cost.
     expect(withSg).toBeLessThan(baseline)
   })
@@ -121,14 +140,47 @@ describe('compression — features should win on the right images', () => {
       return [c[0], c[1], c[2], 255]
     })
     const baseline = expectRoundTrip(img, NO_FEATURES)
-    const withCache = expectRoundTrip(img, { useColorCache: true, subtractGreen: false, useLZ77: false })
+    const withCache = expectRoundTrip(img, { ...NO_FEATURES, useColorCache: true })
     expect(withCache).toBeLessThan(baseline)
+  })
+
+  it('predictor wins big on smooth gradients', () => {
+    const img = makeImage(64, 64, (x, y) => [(x * 4) % 256, (y * 4) % 256, 128, 255])
+    const baseline = expectRoundTrip(img, NO_FEATURES)
+    const withPredictor = expectRoundTrip(img, { ...NO_FEATURES, predictor: true })
+    // Gradients are almost perfectly predicted from neighbours; the
+    // residuals collapse to a few distinct values dominated by zero.
+    expect(withPredictor).toBeLessThan(baseline / 3)
+  })
+
+  it('color-indexing wins big on palette images', () => {
+    // 8-color palette → the encoder packs 4 indices per byte and the
+    // bitstream's pixel stream shrinks dramatically. Without CI, this
+    // image is just a literal/cache stream over the same 8 colours;
+    // with CI, only ~16 × 64 = 1024 packed-pixel words are emitted.
+    const palette: [number, number, number][] = [
+      [200, 50, 50], [50, 200, 50], [50, 50, 200], [200, 200, 50],
+      [50, 200, 200], [200, 50, 200], [100, 100, 100], [200, 200, 200],
+    ]
+    const img = makeImage(64, 64, (x, y) => {
+      const c = palette[((x * 17 + y * 13) % 8 + 8) % 8]
+      return [c[0], c[1], c[2], 255]
+    })
+    const baseline = expectRoundTrip(img, NO_FEATURES)
+    const withCI = expectRoundTrip(img, { ...NO_FEATURES, useColorIndex: true })
+    // 8-colour palette + 4× packing factor; the green-channel alphabet
+    // grows by the same factor (we now have packed multi-indices), so
+    // the *raw* compression isn't 4× — but the multi-index green codes
+    // become roughly uniform 8-bit, much smaller than three independent
+    // 8-colour channels emitted as literals. ~40 % is a reliable floor
+    // for this size of palette image.
+    expect(withCI).toBeLessThan(baseline * 0.6)
   })
 
   it('all features combined beat baseline on photo-like images', () => {
     // Smooth tonal variation across the image — close to what a real
-    // natural photo looks like at small scale. Tests that the three
-    // features compose correctly and don't regress against each other.
+    // natural photo looks like at small scale. Tests that the features
+    // compose correctly and don't regress against each other.
     const img = makeImage(96, 96, (x, y) => {
       const r = Math.max(0, Math.min(255, (100 + Math.sin(x * 0.1) * 60 + Math.cos(y * 0.13) * 40) | 0))
       const g = Math.max(0, Math.min(255, (110 + Math.sin(x * 0.1) * 60 + Math.cos(y * 0.13) * 40) | 0))

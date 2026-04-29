@@ -3,6 +3,8 @@ import { BitReader } from '../bitreader'
 import { DISTANCE_EXTRA_BITS, distanceFromCode, NUM_DISTANCE_CODES } from './distance'
 import { HuffmanTree, readHuffmanTree } from './huffman'
 import { LENGTH_EXTRA_BITS, lengthFromCode, NUM_LENGTH_CODES } from './length'
+import { inverseColorTransform } from './color'
+import { deltaDecodePalette, inverseColorIndexTransform, packingFactor } from './color-index'
 import { inversePredictorTransform } from './predictor'
 
 /**
@@ -45,6 +47,10 @@ interface TransformRecord {
   modeImage?: Uint32Array
   modeWidth?: number
   modeHeight?: number
+  /** For color-indexing: the post-delta-decode palette. */
+  palette?: Uint32Array
+  /** For color-indexing: the encoded width seen by the pixel decoder. */
+  encodedWidth?: number
 }
 
 export function decodeVP8L(data: Uint8Array): WebpImageData {
@@ -93,7 +99,12 @@ function readHeader(reader: BitReader): VP8LHeader {
 
 function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
   // ── Read the transform chain (max 4 entries per spec) ──
+  // `effectiveWidth` tracks the width seen by transforms that come *after*
+  // a color-indexing transform — color-indexing reduces the encoded image
+  // width, and downstream predictor mode-image sizes are derived from
+  // the reduced width, not the original.
   const transforms: TransformRecord[] = []
+  let effectiveWidth = header.width
   while (reader.readBit() === 1) {
     if (transforms.length >= 4) throw new Error('VP8L: more than 4 transforms')
     const type = reader.readBits(2)
@@ -102,15 +113,31 @@ function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
     } else if (type === TRANSFORM_PREDICTOR) {
       // Predictor: 3 bits (size_bits - 2) then a sub-image of mode-per-block.
       const bits = reader.readBits(3) + 2
-      const modeWidth = (header.width + (1 << bits) - 1) >>> bits
+      const modeWidth = (effectiveWidth + (1 << bits) - 1) >>> bits
       const modeHeight = (header.height + (1 << bits) - 1) >>> bits
       const modeImage = readSubImage(reader, modeWidth, modeHeight)
       transforms.push({ type, bits, modeImage, modeWidth, modeHeight })
+    } else if (type === TRANSFORM_COLOR) {
+      // Color: 3-bit (size_bits-2) + a per-block coefficient sub-image.
+      const bits = reader.readBits(3) + 2
+      const ctWidth = (effectiveWidth + (1 << bits) - 1) >>> bits
+      const ctHeight = (header.height + (1 << bits) - 1) >>> bits
+      const ctImage = readSubImage(reader, ctWidth, ctHeight)
+      transforms.push({ type, bits, modeImage: ctImage, modeWidth: ctWidth, modeHeight: ctHeight })
+    } else if (type === TRANSFORM_COLOR_INDEXING) {
+      // Color-indexing: 8-bit palette_size-1 + 1-row sub-image with the
+      // delta-encoded palette. After this transform the decoded pixel
+      // stream operates at a reduced width (palette ≤ 16 packs multiple
+      // indices per output pixel).
+      const paletteSize = reader.readBits(8) + 1
+      const deltaPalette = readSubImage(reader, paletteSize, 1)
+      const palette = deltaDecodePalette(deltaPalette)
+      const factor = packingFactor(paletteSize)
+      const encodedWidth = (effectiveWidth + factor - 1) / factor | 0
+      effectiveWidth = encodedWidth
+      transforms.push({ type, palette, encodedWidth })
     } else {
-      const name = type === TRANSFORM_COLOR ? 'color'
-        : type === TRANSFORM_COLOR_INDEXING ? 'color-indexing'
-          : `unknown(${type})`
-      throw new Error(`VP8L: ${name} transform not yet supported`)
+      throw new Error(`VP8L: unknown transform type ${type}`)
     }
   }
 
@@ -139,24 +166,44 @@ function decodeImage(reader: BitReader, header: VP8LHeader): Uint32Array {
   const distTree = readHuffmanTree(reader, NUM_DISTANCE_CODES)
 
   // ── Decode pixels ──
-  const argb = decodePixelStream(
+  // The pixel stream is sized at `effectiveWidth × header.height` — color-
+  // indexing may have shrunk the working width below the original.
+  let argb = decodePixelStream(
     reader,
     greenTree,
     redTree,
     blueTree,
     alphaTree,
     distTree,
-    header.width * header.height,
+    effectiveWidth * header.height,
     colorCacheBits,
     colorCache,
   )
 
-  // ── Apply transform inverses in bitstream order ──
-  for (const t of transforms) {
+  // ── Apply transform inverses in REVERSE bitstream order ──
+  // Spec: transforms appear in the bitstream in their forward-application
+  // order, so to unwind we walk from last to first. With encoder applying
+  // SG → predictor, the bitstream is [SG, predictor] and the decoder
+  // applies inverse-predictor first (un-doing the last-applied transform)
+  // then inverse-SG. For color-indexing alone, the loop runs once.
+  let currentWidth = effectiveWidth
+  for (let i = transforms.length - 1; i >= 0; i--) {
+    const t = transforms[i]
     if (t.type === TRANSFORM_SUBTRACT_GREEN) {
       inverseSubtractGreen(argb)
     } else if (t.type === TRANSFORM_PREDICTOR) {
-      inversePredictorTransform(argb, header.width, header.height, t.bits!, t.modeImage!, t.modeWidth!)
+      inversePredictorTransform(argb, currentWidth, header.height, t.bits!, t.modeImage!, t.modeWidth!)
+    } else if (t.type === TRANSFORM_COLOR) {
+      inverseColorTransform(argb, currentWidth, header.height, t.bits!, t.modeImage!, t.modeWidth!)
+    } else if (t.type === TRANSFORM_COLOR_INDEXING) {
+      // Inverse color-indexing un-packs to the *original* (pre-shrink)
+      // width on this side of the transform stack, restoring full RGBA.
+      const palette = t.palette!
+      const factor = packingFactor(palette.length)
+      const originalWidth = currentWidth * factor // approximate; clamp below
+      const targetWidth = Math.min(originalWidth, header.width)
+      argb = inverseColorIndexTransform(argb, currentWidth, targetWidth, header.height, palette)
+      currentWidth = targetWidth
     }
   }
 

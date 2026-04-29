@@ -3,6 +3,8 @@ import { BitWriter } from '../bitreader'
 import { distanceToCode, NUM_DISTANCE_CODES } from './distance'
 import { buildCodeLengths, lengthsToCodes, reverseBits, writeHuffmanTree } from './huffman'
 import { lengthToCode, MAX_LENGTH, NUM_LENGTH_CODES } from './length'
+import { applyColorTransform } from './color'
+import { applyColorIndexTransform, deltaEncodePalette, MAX_PALETTE_SIZE } from './color-index'
 import { applyPredictorTransform } from './predictor'
 
 /**
@@ -41,8 +43,12 @@ const GREEN_BASE = NUM_LITERAL_CODES + NUM_LENGTH_CODES
 
 /** Transform type 0 = predictor (3-bit size_bits + recursive sub-image). */
 const TRANSFORM_PREDICTOR = 0
+/** Transform type 1 = color (3-bit size_bits + per-block coefficient sub-image). */
+const TRANSFORM_COLOR = 1
 /** Transform type 2 = subtract-green (no payload). */
 const TRANSFORM_SUBTRACT_GREEN = 2
+/** Transform type 3 = color-indexing (palette + packed indices). */
+const TRANSFORM_COLOR_INDEXING = 3
 
 /** Cache bits for the color cache. 11 is the spec maximum. */
 const DEFAULT_CACHE_BITS = 11
@@ -67,6 +73,16 @@ interface InternalOptions {
   predictor: boolean
   /** Block size as `1 << predictorBits`. Spec range: 2..7 (block 4..128). */
   predictorBits: number
+  /** Per-block color transform. Smaller win than predictor; off by default
+   *  because the encoder's coefficient search is moderately expensive. */
+  color: boolean
+  colorBits: number
+  /**
+   * When true, the encoder probes for ≤ 256 distinct colours and (if so)
+   * uses the color-indexing transform instead of SG/predictor. Enabled by
+   * default — it's free to probe and a massive win on palette images.
+   */
+  useColorIndex: boolean
   useLZ77: boolean
   useColorCache: boolean
   cacheBits: number
@@ -81,6 +97,14 @@ function resolveOptions(opts: WebpEncodeOptions): InternalOptions {
     // and a handful of extra bits in the bitstream.
     predictor: o.predictor ?? true,
     predictorBits: o.predictorBits ?? 4,
+    // Color transform: off by default. It typically adds 2-5 % over
+    // SG+predictor on natural images, but the encoder-side coefficient
+    // search is moderately expensive (5×5×5 candidates per block) and
+    // the win can be eaten by the per-block coefficient encoding
+    // overhead on small images.
+    color: o.color ?? false,
+    colorBits: o.colorBits ?? 4,
+    useColorIndex: o.useColorIndex ?? true,
     useLZ77: o.useLZ77 ?? true,
     useColorCache: o.useColorCache ?? true,
     cacheBits: o.cacheBits ?? DEFAULT_CACHE_BITS,
@@ -106,31 +130,69 @@ export function encodeVP8L(
     argb[i] = (data[o + 3] << 24) | (data[o] << 16) | (data[o + 1] << 8) | data[o + 2]
   }
 
-  // ── Step 2: pre-transforms (applied innermost-to-outermost) ──
-  // Spec ordering: encoder applies SG first, then predictor; the
-  // bitstream stores them in REVERSE — predictor metadata before SG —
-  // so the decoder reads them in inverse-application order. Applying SG
-  // first means the predictor operates on already-shifted channels,
-  // which generally helps because SG decorrelates colour planes and
-  // makes neighbour predictions tighter.
-  if (opts.subtractGreen) applySubtractGreen(argb)
+  // ── Step 2: pre-transforms ──
+  // We pick one of two paths based on the input:
+  //   • If the image has ≤ 256 distinct colours: color-indexing alone.
+  //     A palette image needs no per-pixel prediction or channel
+  //     decorrelation, and color-indexing's packed-indices form is
+  //     dramatically smaller than even the best Huffman over the
+  //     original pixel stream.
+  //   • Otherwise: SG + predictor stack (the photo path).
+  // We don't combine the two — color-indexed pixels have R=B=0 and
+  // alpha=0xFF, which makes SG a no-op and predictor's win marginal,
+  // while still adding bitstream metadata overhead. Real-world wins
+  // come from picking the *right* path per image, not stacking them.
+  let workArgb = argb
+  let workWidth = width
+  let usedSubtractGreen = false
   let predictorInfo: { modeImage: Uint32Array, modeWidth: number, modeHeight: number } | null = null
-  if (opts.predictor && width >= 2 && height >= 2) {
-    // Predictor needs at least 2×2 pixels — for smaller images the
-    // mode image would have zero blocks, which is degenerate. Skip
-    // the transform on tiny inputs; their compression overhead would
-    // outweigh any savings anyway.
-    predictorInfo = applyPredictorTransform(argb, width, height, opts.predictorBits)
+  let colorIndexInfo: { palette: Uint32Array, encodedWidth: number } | null = null
+
+  if (opts.useColorIndex) {
+    const result = applyColorIndexTransform(argb, width, height)
+    // Only commit to color-indexing when the palette is small enough
+    // that its packing actually beats the SG/predictor stack. The
+    // packing-factor table caps useful packing at palette ≤ 16; above
+    // that, color-indexing's only saving is a smaller green alphabet,
+    // which loses to the predictor on natural-image content. For smooth
+    // photo-like inputs that happen to have ≤ 256 distinct colours
+    // (e.g. small images with low-amplitude sin/cos blends), the
+    // SG+predictor path wins by a wide margin — so we only take CI
+    // when its packing is non-trivial.
+    if (result !== null && result.palette.length <= 16) {
+      workArgb = result.encodedArgb
+      workWidth = result.encodedWidth
+      colorIndexInfo = { palette: result.palette, encodedWidth: result.encodedWidth }
+    }
+  }
+
+  let colorInfo: { ctImage: Uint32Array, ctWidth: number, ctHeight: number } | null = null
+  if (!colorIndexInfo) {
+    // Application order: color first, then SG, then predictor. SG depends
+    // on green being roughly representative of the block; if color has
+    // already shifted red/blue, SG operates on the residuals which keeps
+    // the channels small.
+    if (opts.color && workWidth >= 2 && height >= 2) {
+      colorInfo = applyColorTransform(workArgb, workWidth, height, opts.colorBits)
+    }
+    if (opts.subtractGreen) {
+      applySubtractGreen(workArgb)
+      usedSubtractGreen = true
+    }
+    if (opts.predictor && workWidth >= 2 && height >= 2) {
+      predictorInfo = applyPredictorTransform(workArgb, workWidth, height, opts.predictorBits)
+    }
   }
 
   // ── Step 3: tokenize ──
-  // Worst case = one token per pixel (all literals). We allocate parallel
-  // typed arrays at that size and track the actual count separately.
-  // This avoids ~50-70 MB of GC pressure on 1 MP+ images.
-  const tokenKind = new Uint8Array(numPixels)
-  const tokenA = new Uint32Array(numPixels)
-  const tokenB = new Uint32Array(numPixels)
-  const numTokens = tokenize(argb, opts, tokenKind, tokenA, tokenB)
+  // Tokenize the post-transform image. Note that workArgb may be smaller
+  // than the original (color-indexing reduces width), so the actual
+  // tokenization size is `workArgb.length`, not `numPixels`.
+  const workNumPixels = workArgb.length
+  const tokenKind = new Uint8Array(workNumPixels)
+  const tokenA = new Uint32Array(workNumPixels)
+  const tokenB = new Uint32Array(workNumPixels)
+  const numTokens = tokenize(workArgb, opts, tokenKind, tokenA, tokenB)
 
   // ── Step 4: histograms + trees ──
   const cacheSize = opts.useColorCache ? 1 << opts.cacheBits : 0
@@ -190,21 +252,47 @@ export function encodeVP8L(
   writer.writeBit(imageData.hasAlpha ? 1 : 0)
   writer.writeBits(0, 3) // version
 
-  // Bitstream transform order is REVERSE of application order. The
-  // last-applied transform is read first by the decoder so its inverse
-  // is applied first. Encoder applied: SG, then predictor. Bitstream
-  // emits: predictor-meta, then SG-meta.
-  if (predictorInfo) {
+  // Spec: transforms appear in the bitstream in the *forward* order they
+  // were applied. The decoder reads them in order then applies inverses
+  // in reverse, which unwinds the encoder's stack.
+  //
+  // We use one of two transform stacks at most:
+  //   • [color-indexing]              for palette images
+  //   • [subtract-green, predictor]   for photo content
+  // Mixing the two doesn't help (see Step 2), so the bitstream emits at
+  // most one stack.
+  if (colorIndexInfo) {
     writer.writeBit(1) // transform-present
-    writer.writeBits(TRANSFORM_PREDICTOR, 2)
-    writer.writeBits(opts.predictorBits - 2, 3)
-    writeSubImage(writer, predictorInfo.modeImage, predictorInfo.modeWidth, predictorInfo.modeHeight)
-  }
-  if (opts.subtractGreen) {
-    writer.writeBit(1) // transform-present
-    writer.writeBits(TRANSFORM_SUBTRACT_GREEN, 2)
+    writer.writeBits(TRANSFORM_COLOR_INDEXING, 2)
+    writer.writeBits(colorIndexInfo.palette.length - 1, 8)
+    // Palette is delta-encoded on the wire. The decoder undoes the
+    // delta after reading the palette sub-image.
+    const deltaPalette = deltaEncodePalette(colorIndexInfo.palette)
+    writeSubImage(writer, deltaPalette, deltaPalette.length, 1)
+  } else {
+    // Photo-path order: color, then SG, then predictor — same order as
+    // applied. The decoder reads them in this order and applies inverse
+    // in reverse (predictor, then SG, then color), which unwinds the
+    // encoder stack correctly.
+    if (colorInfo) {
+      writer.writeBit(1)
+      writer.writeBits(TRANSFORM_COLOR, 2)
+      writer.writeBits(opts.colorBits - 2, 3)
+      writeSubImage(writer, colorInfo.ctImage, colorInfo.ctWidth, colorInfo.ctHeight)
+    }
+    if (usedSubtractGreen) {
+      writer.writeBit(1) // transform-present
+      writer.writeBits(TRANSFORM_SUBTRACT_GREEN, 2)
+    }
+    if (predictorInfo) {
+      writer.writeBit(1) // transform-present
+      writer.writeBits(TRANSFORM_PREDICTOR, 2)
+      writer.writeBits(opts.predictorBits - 2, 3)
+      writeSubImage(writer, predictorInfo.modeImage, predictorInfo.modeWidth, predictorInfo.modeHeight)
+    }
   }
   writer.writeBit(0) // end of transform chain
+  void MAX_PALETTE_SIZE // reference so import isn't dead
 
   if (opts.useColorCache) {
     writer.writeBit(1) // color-cache present
