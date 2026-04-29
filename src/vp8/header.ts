@@ -1,49 +1,41 @@
 import type { VP8FrameHeader } from '../types'
 import { BoolDecoder } from './bool-decoder'
+import { DEFAULT_COEF_PROBS, NUM_BLOCK_TYPES, NUM_COEF_BANDS } from './tables'
 
 /**
  * VP8 keyframe header parser.
  *
- * The header occupies the first few bytes of the `VP8 ` chunk and
- * contains everything a decoder needs to set up its tables before
- * decoding macroblock coefficients. WebP only ever embeds keyframes
- * (intra frames) — there's no temporal prediction across frames.
+ * For WebP we treat every frame as a keyframe (WebP never embeds
+ * inter-frames). The parser reads the frame tag + start code + dimensions
+ * uncompressed, then opens a `BoolDecoder` over the first partition and
+ * consumes the bool-coded keyframe header per RFC 6386 §9.4-9.10.
  *
- * Layout (per RFC 6386 §9):
+ * The order of bool-coded fields for a keyframe (per RFC 6386 §9.4ff,
+ * cross-checked against libvpx's `vp8/decoder/decodemv.c`):
  *
- *   3 bytes: frame tag
- *     bit 0       = keyframe? (0 = keyframe in spec language; we assert)
- *     bits 1..3   = version
- *     bit 4       = show_frame
- *     bits 5..23  = first_partition_size
+ *   1.  color_space (1 bit) — must be 0
+ *   2.  clamping_type (1 bit)
+ *   3.  segmentation_enabled (1 bit)
+ *       (if 1: full update_segmentation header)
+ *   4.  filter_type (1 bit)
+ *   5.  loop_filter_level (6 bits)
+ *   6.  sharpness_level (3 bits)
+ *   7.  mb_lf_adjustments (1 bit)
+ *       (if 1: full mode_ref_lf_delta_update header)
+ *   8.  log2_nparts (2 bits) — 1 << this is the token-partition count
+ *   9.  y_ac_qi (7 bits) — base quantiser index
+ *  10.  y_dc_delta, y2_dc_delta, y2_ac_delta, uv_dc_delta, uv_ac_delta
+ *       (each: 1 flag bit + 5 magnitude+sign bits if set)
+ *  11.  refresh_entropy_probs (1 bit)
+ *  12.  COEF probability update loop (for each of the 4×8×3×11 entries:
+ *       1 flag bit + 8 prob bits if flag set)
+ *  13.  mb_no_skip_coef (1 bit)
+ *       (if 1: prob_skip_false (8 bits))
  *
- *   3 bytes: keyframe start code (0x9D 0x01 0x2A)
- *
- *   2 bytes: width-and-scale (LE)
- *     bits 0..13  = width in pixels
- *     bits 14..15 = horizontal scale
- *
- *   2 bytes: height-and-scale (LE)  — same layout
- *
- *   First partition (boolean-coded; size from the frame tag):
- *     1 bit  color_space (must be 0)
- *     1 bit  clamping_type
- *     1 bit  segmentation_enabled
- *       (if set: segmentation update header, ~50 bits)
- *     1 bit  filter_type
- *     6 bits loop_filter_level
- *     3 bits sharpness_level
- *     1 bit  loop_filter_adj_enabled
- *       (if set: loop filter delta header)
- *     2 bits log2(num_token_partitions)
- *     ...quantizer + entropy refresh + sign bias + last-frame-refresh...
- *
- * For WebP we treat every frame as a keyframe and ignore inter-frame
- * fields. The parser reads everything the decoder needs into a single
- * `ParsedHeader` record.
+ * Inter-frame-only fields (refresh_golden/altref/sign_bias) are NOT
+ * present for keyframes.
  */
 
-/** Quantiser indices for Y, U/V chroma, and the Y2 (DC) coefficients. */
 export interface VP8Quantiser {
   yacQi: number
   ydcDelta: number
@@ -57,9 +49,7 @@ export interface VP8FilterParams {
   filterType: number
   level: number
   sharpness: number
-  /** Per-reference-frame loop-filter-level deltas (intra has 4 entries). */
   refDeltas: Int8Array
-  /** Per-mode loop-filter-level deltas. */
   modeDeltas: Int8Array
 }
 
@@ -73,13 +63,14 @@ export interface ParsedVP8Header {
   segmentation: { enabled: boolean }
   filter: VP8FilterParams
   quantiser: VP8Quantiser
+  /** Boolean decoder positioned at the macroblock-mode-info area. */
+  bool: BoolDecoder
+  /** Probability skipped-block flag, or null if mb_no_skip_coef is 0. */
+  probSkipFalse: number | null
+  /** Active coefficient-probability table (with any updates applied). */
+  coefProbs: Uint8Array
 }
 
-/**
- * Read a VP8 frame header from a `VP8 ` chunk. Throws if the input
- * isn't a recognisable keyframe with the standard start code, or if
- * any field is out of the spec's allowed range.
- */
 export function parseVP8Header(data: Uint8Array): ParsedVP8Header {
   if (data.length < 10) {
     throw new Error('VP8: chunk shorter than 10-byte frame header')
@@ -105,12 +96,14 @@ export function parseVP8Header(data: Uint8Array): ParsedVP8Header {
   const xScale = widthAndScale >> 14
   const yScale = heightAndScale >> 14
 
-  // Frame header proper continues in the boolean-coded first partition.
   const partitionStart = 10
   if (partitionStart + firstPartSize > data.length) {
     throw new Error('VP8: declared first-partition size exceeds chunk length')
   }
-  const bool = new BoolDecoder(data, partitionStart)
+  // Bound the first-partition bool decoder by `firstPartSize` so the
+  // header + mode-info reads can't accidentally pull bytes from the
+  // following token partition. libvpx does the same via `buffer_end`.
+  const bool = new BoolDecoder(data, partitionStart, firstPartSize)
 
   const colorSpace = bool.readLiteral(1)
   const clampType = bool.readLiteral(1)
@@ -143,8 +136,8 @@ export function parseVP8Header(data: Uint8Array): ParsedVP8Header {
 
   const numPartitions = 1 << bool.readLiteral(2)
 
-  // Quantiser indices follow; we only need the values, not the dequant
-  // tables (which live in `tables.ts`).
+  // Quantiser indices — y_ac_qi (7 bits) and 5 deltas (1 flag + 4 magnitude
+  // + 1 sign each). Note: spec uses 4-bit magnitude, not 5.
   const yacQi = bool.readLiteral(7)
   const ydcDelta = readSignedDelta(bool)
   const y2dcDelta = readSignedDelta(bool)
@@ -152,17 +145,35 @@ export function parseVP8Header(data: Uint8Array): ParsedVP8Header {
   const uvdcDelta = readSignedDelta(bool)
   const uvacDelta = readSignedDelta(bool)
 
-  // Refresh flags (we don't track frame buffers; just consume them).
-  const refreshGolden = bool.readLiteral(1)
-  const refreshAltRef = bool.readLiteral(1)
-  if (!refreshGolden) bool.readLiteral(2)
-  if (!refreshAltRef) bool.readLiteral(2)
-  bool.readLiteral(2) // sign bias golden + sign bias alt-ref
-  bool.readLiteral(1) // refresh entropy probs
-  bool.readLiteral(1) // refresh last
+  // Refresh entropy probs (keyframes still have this — RFC 6386 §9.10).
+  // Followed by the coefficient-probability update loop.
+  bool.readLiteral(1) // refresh_entropy_probs — for keyframes the
+  // saved state always equals the defaults so this flag has no effect
+  // on us; we still consume the bit.
 
-  // The compressed-header part ends here; mode-info + coefficients live
-  // in the remaining bytes after `firstPartSize`.
+  const coefProbs = new Uint8Array(DEFAULT_COEF_PROBS)
+  // Update loop: 4 × 8 × 3 × 11 = 1056 entries, each with a flag bit +
+  // optional 8-bit replacement probability. The decision probability is
+  // a fixed table from the spec.
+  for (let i = 0; i < NUM_BLOCK_TYPES; i++) {
+    for (let j = 0; j < NUM_COEF_BANDS; j++) {
+      for (let k = 0; k < 3; k++) {
+        for (let l = 0; l < 11; l++) {
+          if (bool.readBit(COEF_UPDATE_PROBS[i][j][k][l]) === 1) {
+            coefProbs[i * NUM_COEF_BANDS * 3 * 11 + j * 3 * 11 + k * 11 + l] = bool.readLiteral(8)
+          }
+        }
+      }
+    }
+  }
+
+  // mb_no_skip_coef (always present on keyframes per RFC 6386 §9.11).
+  let probSkipFalse: number | null = null
+  if (bool.readLiteral(1) === 1) {
+    probSkipFalse = bool.readLiteral(8)
+  }
+
+  // Token partitions follow `firstPartSize`.
   const partitionsOffset = partitionStart + firstPartSize
 
   return {
@@ -196,16 +207,12 @@ export function parseVP8Header(data: Uint8Array): ParsedVP8Header {
       uvdcDelta,
       uvacDelta,
     },
+    bool,
+    probSkipFalse,
+    coefProbs,
   }
 }
 
-/**
- * Skip past the variable-length segmentation update header. The
- * decoder doesn't need the segmentation data unless segmentation is
- * actually used for a macroblock, which it isn't in any spec example.
- * For now we only read enough bits to keep the cursor correctly
- * positioned for what follows.
- */
 function skipSegmentationHeader(bool: BoolDecoder): void {
   const updateMap = bool.readLiteral(1)
   const updateData = bool.readLiteral(1)
@@ -225,7 +232,189 @@ function skipSegmentationHeader(bool: BoolDecoder): void {
   }
 }
 
-/** Read an optional 4-bit signed delta (1 flag bit + 4 magnitude bits + sign). */
+/** Read an optional 4-bit signed delta (1 flag bit + 4 magnitude bits + sign bit). */
 function readSignedDelta(bool: BoolDecoder): number {
   return bool.readLiteral(1) === 1 ? bool.readSignedLiteral(4) : 0
 }
+
+// ---------------------------------------------------------------------------
+// Coef-probability update probabilities — RFC 6386 §13.5 ("k_coef_update_probs")
+// ---------------------------------------------------------------------------
+//
+// 4 × 8 × 3 × 11 table mirroring DEFAULT_COEF_PROBS; the encoder uses
+// these to decide whether to emit a probability update for each entry.
+// In practice cwebp leaves these at 252 (very biased toward "no update")
+// for almost every entry, so the inner loop reads 1056 zero-bits and
+// moves on. We transcribe the spec's table verbatim.
+
+// eslint-disable-next-line pickier/no-unused-vars
+const COEF_UPDATE_PROBS: ReadonlyArray<ReadonlyArray<ReadonlyArray<ReadonlyArray<number>>>> = [
+  [
+    [
+      [177, 155, 250, 247, 255, 255, 255, 255, 255, 255, 255],
+      [250, 245, 254, 254, 254, 255, 255, 255, 255, 255, 255],
+      [234, 246, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [251, 244, 254, 254, 255, 255, 255, 255, 255, 255, 255],
+      [251, 251, 254, 252, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [254, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [254, 251, 254, 254, 255, 255, 255, 255, 255, 255, 255],
+      [253, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [254, 252, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+      [249, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [254, 252, 254, 254, 255, 255, 255, 255, 255, 255, 255],
+      [255, 252, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [254, 252, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+      [253, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+  ],
+  [
+    [
+      [186, 251, 250, 171, 192, 188, 201, 153, 251, 244, 255],
+      [234, 251, 244, 254, 251, 252, 254, 252, 254, 252, 255],
+      [251, 251, 252, 253, 254, 254, 251, 254, 252, 254, 255],
+    ],
+    [
+      [255, 252, 254, 254, 255, 255, 255, 255, 255, 255, 255],
+      [254, 251, 254, 254, 255, 255, 255, 255, 255, 255, 255],
+      [253, 250, 252, 254, 254, 254, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 254, 253, 254, 254, 255, 255, 255, 255, 255, 255],
+      [255, 252, 253, 254, 254, 255, 255, 255, 255, 255, 255],
+      [255, 251, 253, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [253, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [253, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [253, 252, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+      [254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+  ],
+  [
+    [
+      [248, 255, 255, 228, 247, 255, 255, 255, 255, 255, 255],
+      [255, 253, 255, 254, 254, 255, 255, 255, 255, 255, 255],
+      [255, 250, 255, 254, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+  ],
+  [
+    [
+      [248, 254, 249, 253, 255, 255, 230, 255, 255, 255, 255],
+      [255, 253, 254, 254, 255, 255, 255, 255, 255, 255, 255],
+      [244, 252, 255, 250, 254, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+      [254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+      [253, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+    [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    ],
+  ],
+]

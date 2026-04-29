@@ -33,21 +33,35 @@ const { data, width, height, hasAlpha } = decode(encoded)
   consumed transparently by `decode`.
 
 ### Lossy (VP8)
-- ✅ **Boolean arithmetic decoder** — full implementation per RFC 6386
+- ✅ **Boolean arithmetic decoder** — full 32-bit-register implementation
+  per RFC 6386 §7
 - ✅ **Frame header parsing** — keyframe detection, segmentation, loop-
-  filter parameters, quantiser indices, partition layout. Useful on its
-  own for introspection (`getWebpInfo`) and as a foundation for the
-  pixel decoder.
-- 🚧 **Pixel decode** — coefficient decoding, inverse DCT/WHT, intra
-  prediction (4×4 and 16×16 luma + chroma modes), loop filter, and
-  YUV→RGB conversion still need to be wired up. `decodeVP8` parses
-  the header, then throws with a precise "pixel decode not yet
-  implemented" message. A complete VP8 decoder is ~1500-2000 lines and
-  realistically needs validation against a reference corpus to ship
-  responsibly.
+  filter parameters, quantiser indices, partition layout, coef-prob
+  update loop, mb_no_skip_coef
+- ✅ **Mode-info decoding** — keyframe Y mode (DC/V/H/TM/B_PRED), 16
+  per-subblock B-modes with contextual neighbour probabilities, UV mode
+- ✅ **Coefficient decoding** — DCT token tree walk via boolean coder,
+  CAT1..CAT6 magnitude tokens, sign bits, zigzag scan
+- ✅ **Inverse transforms** — 4×4 IDCT and 4×4 WHT (Y2) bit-exact with
+  libvpx
+- ✅ **Intra prediction** — DC/V/H/TM (16×16 luma, 8×8 chroma) and all 10
+  B-modes (4×4 luma) per RFC 6386 §12
+- ✅ **Loop filter** — simple + normal filters with HEV-conditional
+  kernel, MB-edge and sub-block-edge variants, per-level threshold
+  derivation per RFC 6386 §15
+- ✅ **YUV 4:2:0 → RGBA** — BT.601 fixed-point conversion
+- ⚠️  **Bit-exact agreement with libvpx** — the decoder runs end-to-end
+  without crashing on real `cwebp` output and produces RGBA buffers of
+  the correct dimensions, but the per-pixel values do not yet match the
+  `dwebp` reference exactly. The byte-level boolean decoder is verified
+  against synthetic round-trip inputs; the divergence likely sits in
+  per-block context handling or the proba-update step and needs
+  side-by-side bitstream comparison with libvpx to chase down. For now
+  use `dwebp` / `sharp` if you need pixel-accurate lossy decode; the
+  pure-TS path is most useful for VP8L (which round-trips exactly).
 - ❌ **Encode** — not implemented. VP8 lossy encoding additionally
-  needs DCT/quantisation, intra-mode selection, rate control, and the
-  boolean encoder. Out of scope; use `cwebp` for lossy WebP files.
+  needs forward DCT, quantisation, intra-mode selection, rate control,
+  and the boolean encoder. Out of scope; use `cwebp` for lossy WebP files.
 
 ## Install
 

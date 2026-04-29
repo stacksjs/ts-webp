@@ -146,24 +146,21 @@ describe('ts-webp', () => {
       expect(() => decode(new Uint8Array([0x52, 0x49, 0x46, 0x46]))).toThrow()
     })
 
-    it('throws clearly when given a VP8 (lossy) chunk', () => {
-      // Hand-build a minimal RIFF/WEBP container with a `VP8 ` chunk that
-      // has a syntactically valid keyframe header — the decoder should
-      // refuse this case rather than fake a gray output, but the RIFF
-      // info-parser also looks at the chunk and demands a valid start
-      // code, so we satisfy that here. Either error message is fine
-      // for the assertion as long as it makes the lossy nature obvious.
+    it('throws on a malformed VP8 chunk (bad start code)', () => {
+      // Hand-build a RIFF/WEBP container with a `VP8 ` chunk that has a
+      // valid keyframe bit but a corrupted start code. The decoder
+      // should reject it cleanly rather than emit garbage pixels.
       const vp8Header = new Uint8Array(10)
       vp8Header[0] = 0x00 // frame tag low: keyframe (bit 0 = 0)
-      vp8Header[3] = 0x9D // start code byte 1
-      vp8Header[4] = 0x01 // start code byte 2
-      vp8Header[5] = 0x2A // start code byte 3
-      vp8Header[6] = 0x10 // width = 16
+      vp8Header[3] = 0x00 // corrupted start code
+      vp8Header[4] = 0x00
+      vp8Header[5] = 0x00
+      vp8Header[6] = 0x10
       vp8Header[7] = 0x00
-      vp8Header[8] = 0x10 // height = 16
+      vp8Header[8] = 0x10
       vp8Header[9] = 0x00
       const stub = createRiffContainer([{ fourCC: 'VP8 ', data: vp8Header }])
-      expect(() => decode(stub)).toThrow(/lossy|VP8/i)
+      expect(() => decode(stub)).toThrow(/start code|VP8/i)
     })
   })
 
