@@ -146,10 +146,22 @@ describe('decoder crash-resistance', () => {
   })
 })
 
-describe('encoder explicit-lossy rejection', () => {
-  it('encode({ lossless: false }) throws clearly', () => {
-    const data = new Uint8Array(16)
-    expect(() => encode({ data, width: 2, height: 2 }, { lossless: false })).toThrow(/lossy/i)
+describe('encoder lossy / lossless switching', () => {
+  it('encode({ lossless: false }) produces a VP8 (lossy) byte stream', () => {
+    // Use a 16×16 patch — anything smaller would round to 1 macroblock
+    // for VP8 with a near-empty token partition, which is too small to
+    // be a meaningful sanity check.
+    const data = new Uint8Array(16 * 16 * 4)
+    for (let i = 0; i < 16 * 16; i++) {
+      data[i * 4 + 0] = 100
+      data[i * 4 + 1] = 150
+      data[i * 4 + 2] = 200
+      data[i * 4 + 3] = 255
+    }
+    const out = encode({ data, width: 16, height: 16 }, { lossless: false })
+    expect(out.length).toBeGreaterThan(20)
+    // VP8 chunk fourCC at offset 12 (RIFF + size + WEBP = 12 bytes).
+    expect(String.fromCharCode(out[12], out[13], out[14], out[15])).toBe('VP8 ')
   })
 
   it('encode({}) defaults to lossless and succeeds', () => {

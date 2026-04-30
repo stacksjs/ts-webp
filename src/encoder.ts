@@ -1,32 +1,50 @@
 import type { WebpEncodeOptions, WebpImageData } from './types'
 import { createRiffContainer } from './riff'
+import { encodeVP8 } from './vp8/encoder'
 import { encodeVP8L } from './vp8l/encoder'
 
 /**
- * Encode RGBA pixel data to WebP format. Always lossless today; a
- * lossy (`VP8`) encoder isn't implemented and explicit `lossless: false`
- * throws rather than silently fall back. Pass `lossless: true` (or omit)
- * for VP8L output.
+ * Encode RGBA pixel data to a WebP byte buffer.
+ *
+ * Defaults to lossless (VP8L). Pass `lossless: false` to use the VP8
+ * lossy encoder — note that the lossy path is a minimal-but-functional
+ * implementation (16×16 intra-DC prediction, no mode search, single
+ * segment) so the rate-distortion isn't competitive with `cwebp`. Use
+ * lossless for any case that needs the smallest output or strict
+ * fidelity, and lossy only when the caller can tolerate visible
+ * artefacts in exchange for a small/predictable bitstream.
  */
 export function encode(
   imageData: WebpImageData,
   options: WebpEncodeOptions = {},
 ): Uint8Array {
   const { lossless = true } = options
-
   if (lossless) return encodeLossless(imageData, options)
+  return encodeLossy(imageData, options)
+}
 
-  // The previous behaviour was to silently fall back to lossless when
-  // `lossless: false` was passed, which is a footgun: callers that
-  // explicitly opt into lossy compression deserve to know they're not
-  // getting it. The README still documents `quality` and `effort` as
-  // if lossy were available, but until it is we throw rather than
-  // silently producing a (potentially much larger) lossless file.
-  throw new Error(
-    'ts-webp: lossy (VP8) encoding is not implemented. '
-    + 'Pass `{ lossless: true }` (or omit `lossless`) to get the VP8L '
-    + 'lossless encoder, which supports the full RGBA range.',
-  )
+/**
+ * Encode as lossy WebP (VP8). Produces a `RIFF/WEBP/VP8 ` byte stream.
+ * The current implementation always uses 16×16 intra-DC prediction and
+ * a single token partition — see `vp8/encoder.ts` for the scope notes.
+ *
+ * Alpha is silently dropped from the output (VP8 itself doesn't carry
+ * alpha; the `VP8X + ALPH + VP8` extended container would be required,
+ * which we don't emit on the encode side yet). Round-tripping an opaque
+ * image is fine; round-tripping a transparent one will lose alpha.
+ */
+function encodeLossy(imageData: WebpImageData, options: WebpEncodeOptions): Uint8Array {
+  // Map the public `quality: 0..100` (cwebp convention, higher = better)
+  // to the internal q-index `0..127` (lower = better). This is a
+  // monotonic-but-coarse mapping; libwebp uses a more elaborate
+  // rate-control loop we don't replicate.
+  const q100 = options.quality ?? 75
+  if (q100 < 0 || q100 > 100) throw new Error('ts-webp: quality must be 0..100')
+  const qIndex = Math.round(127 - (q100 / 100) * 127)
+  const vp8Data = encodeVP8(imageData, { quality: qIndex })
+  return createRiffContainer([
+    { fourCC: 'VP8 ', data: vp8Data },
+  ])
 }
 
 /**
