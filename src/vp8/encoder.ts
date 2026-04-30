@@ -108,7 +108,7 @@ export function encodeVP8(image: WebpImageData, options: VP8EncodeOptions = {}):
   // ── 2. Quantiser tables (spec §11.4) ──
   const y1Dc = DC_QUANT[clampQi(baseQ)]
   const y1Ac = AC_QUANT[clampQi(baseQ)]
-  let y2Dc = DC_QUANT[clampQi(baseQ)] * 2
+  const y2Dc = DC_QUANT[clampQi(baseQ)] * 2
   let y2Ac = (AC_QUANT[clampQi(baseQ)] * 101581) >> 16
   if (y2Ac < 8) y2Ac = 8
   void y2Dc
