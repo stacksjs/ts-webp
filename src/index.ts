@@ -1,6 +1,7 @@
 export { decodeAnimation } from './animation'
 export { decode } from './decoder'
-export { encode, encodeWithAlpha } from './encoder'
+export { encode, encodeAsync, encodeWithAlpha } from './encoder'
+export { encodeViaCwebp, hasCwebp } from './encoder-cli'
 export { createRiffContainer, getWebpInfo, parseRiff } from './riff'
 export type {
   RiffChunk,

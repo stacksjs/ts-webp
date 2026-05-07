@@ -24,6 +24,29 @@ export interface WebpEncodeOptions {
   effort?: number
   /** Enable alpha channel */
   alpha?: boolean
+  /**
+   * Encoder backend selection.
+   *
+   *   - `'auto'` (default): try the system `cwebp` binary; fall back to
+   *     the pure-TS encoder when it isn't on PATH or fails to spawn.
+   *   - `'cli'`: require the `cwebp` binary; throw if it's missing.
+   *   - `'pure-ts'`: always use the bundled TS encoder (legacy
+   *     behaviour). The lossy path is "minimal-but-functional" and
+   *     will produce significantly larger files than libwebp at
+   *     equivalent quality settings.
+   *
+   * The CLI path is meaningfully more efficient (libwebp's actual
+   * rate-distortion loop) and is preferred for any production use.
+   * Set this explicitly to `'pure-ts'` only when you need offline /
+   * sandboxed encoding without external binaries.
+   */
+  backend?: 'auto' | 'cli' | 'pure-ts'
+  /**
+   * Override the path to the `cwebp` binary. Useful in CI where it's
+   * installed in a non-standard location. Falls back to spawning by
+   * name (`cwebp`) when omitted.
+   */
+  cwebpPath?: string
 }
 
 /**

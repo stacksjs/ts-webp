@@ -1,4 +1,5 @@
 import type { WebpEncodeOptions, WebpImageData } from './types'
+import { encodeViaCwebp, hasCwebp } from './encoder-cli'
 import { createRiffContainer } from './riff'
 import { encodeVP8 } from './vp8/encoder'
 import { encodeVP8L } from './vp8l/encoder'
@@ -21,6 +22,40 @@ export function encode(
   const { lossless = true } = options
   if (lossless) return encodeLossless(imageData, options)
   return encodeLossy(imageData, options)
+}
+
+/**
+ * Async-aware encoder that prefers the system `cwebp` binary
+ * (libwebp) when available, falling back to the bundled pure-TS
+ * encoder when it isn't. Use this for any production output —
+ * libwebp's rate-distortion loop produces files that are 30–60%
+ * smaller than the bundled lossy encoder at equivalent quality.
+ *
+ * Backwards-compat note: the synchronous `encode()` above stays
+ * pure-TS only so existing call sites and tests don't change shape.
+ * New code should prefer `encodeAsync()`.
+ */
+export async function encodeAsync(
+  imageData: WebpImageData,
+  options: WebpEncodeOptions = {},
+): Promise<Uint8Array> {
+  const backend = options.backend ?? 'auto'
+
+  if (backend !== 'pure-ts') {
+    if (await hasCwebp(options.cwebpPath)) {
+      const cliBytes = await encodeViaCwebp(imageData, options)
+      if (cliBytes) return cliBytes
+    }
+    if (backend === 'cli') {
+      throw new Error(
+        'ts-webp: cwebp binary not found on PATH (or failed). '
+        + 'Install libwebp (`brew install webp` / `apt-get install webp`), '
+        + 'set options.cwebpPath, or use backend: "pure-ts".',
+      )
+    }
+  }
+
+  return encode(imageData, options)
 }
 
 /**
