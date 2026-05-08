@@ -119,13 +119,13 @@ describe('compression — features should win on the right images', () => {
     // beat. The 16-pixel motif keeps the green tree multi-symbol so
     // both baseline and LZ77 paths emit real per-pixel bits and the
     // backref savings actually show up in the size diff.
-    const motif = [
+    const motif: [number, number, number, number][] = [
       [10, 20, 30, 255], [10, 20, 30, 255], [10, 20, 30, 255], [10, 20, 30, 255],
       [40, 50, 60, 255], [40, 50, 60, 255], [40, 50, 60, 255], [40, 50, 60, 255],
       [70, 80, 90, 255], [70, 80, 90, 255], [70, 80, 90, 255], [70, 80, 90, 255],
       [110, 120, 130, 255], [110, 120, 130, 255], [110, 120, 130, 255], [110, 120, 130, 255],
     ]
-    const img = makeImage(64, 64, x => motif[x % 16])
+    const img = makeImage(64, 64, x => motif[x % 16]!)
     const baseline = expectRoundTrip(img, NO_FEATURES)
     const withLz77 = expectRoundTrip(img, { ...NO_FEATURES, useLZ77: true })
     expect(withLz77).toBeLessThan(baseline / 2)

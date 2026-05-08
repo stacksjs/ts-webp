@@ -88,5 +88,5 @@ describe('VP8 + ALPH (lossy with alpha)', () => {
   // `alpha-uncompressed` (method=0) and the `alpha-q80` predictor path
   // already exercise the rest of the ALPH chunk machinery. Keeping the
   // assertion as `.todo` so the suite reports it without failing.
-  it.todo('alpha-q95 (color-indexing alpha) — known divergence')
+  it.todo('alpha-q95 (color-indexing alpha) — known divergence', () => {})
 })

@@ -76,18 +76,21 @@ export async function encodeViaCwebp(
   }
 
   // Pipe input then close so cwebp knows the stream is done.
-  const writer = proc.stdin?.getWriter?.()
+  // proc.stdin is typed as `number | FileSink` due to the union of stdio
+  // option types; with `stdin: 'pipe'` it's the FileSink-shaped object.
+  const sink = proc.stdin as { getWriter?: () => { write: (b: Uint8Array) => Promise<void>, close: () => Promise<void> }, write?: (b: Uint8Array) => void, end?: () => void } | undefined
+  const writer = sink?.getWriter?.()
   if (writer) {
     await writer.write(stdin)
     await writer.close()
   }
   else {
-    proc.stdin?.write?.(stdin)
-    proc.stdin?.end?.()
+    sink?.write?.(stdin)
+    sink?.end?.()
   }
 
   const [out, exitCode] = await Promise.all([
-    new Response(proc.stdout).bytes(),
+    new Response(proc.stdout as ReadableStream<Uint8Array>).bytes(),
     proc.exited,
   ])
 

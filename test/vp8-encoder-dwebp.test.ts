@@ -46,7 +46,7 @@ describe.skipIf(!dwebpAvailable)('VP8 lossy encoder × dwebp interop', () => {
     const img = makeImage(16, 16, () => [120, 80, 60, 255])
     const vp8Chunk = encodeVP8(img, { quality: 60 })
     const webp = createRiffContainer([
-      { fourCC: 'VP8 ', data: vp8Chunk, size: vp8Chunk.length },
+      { fourCC: 'VP8 ', data: vp8Chunk },
     ])
     const path = join(tmpdir(), `ts-webp-vp8-test-${Date.now()}.webp`)
     writeFileSync(path, webp)
@@ -62,7 +62,7 @@ describe.skipIf(!dwebpAvailable)('VP8 lossy encoder × dwebp interop', () => {
     const img = makeImage(32, 32, x => [(x * 8) & 0xFF, 128, 200, 255])
     const vp8Chunk = encodeVP8(img, { quality: 50 })
     const webp = createRiffContainer([
-      { fourCC: 'VP8 ', data: vp8Chunk, size: vp8Chunk.length },
+      { fourCC: 'VP8 ', data: vp8Chunk },
     ])
     const path = join(tmpdir(), `ts-webp-vp8-test2-${Date.now()}.webp`)
     writeFileSync(path, webp)

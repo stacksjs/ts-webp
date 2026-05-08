@@ -142,7 +142,7 @@ export function encodeVP8L(
   // alpha=0xFF, which makes SG a no-op and predictor's win marginal,
   // while still adding bitstream metadata overhead. Real-world wins
   // come from picking the *right* path per image, not stacking them.
-  let workArgb = argb
+  let workArgb: Uint32Array = argb
   let workWidth = width
   let usedSubtractGreen = false
   let predictorInfo: { modeImage: Uint32Array, modeWidth: number, modeHeight: number } | null = null
