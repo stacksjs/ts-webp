@@ -50,10 +50,10 @@
     "typecheck": "bun --bun tsc --noEmit",
     "changelog": "bunx --bun logsmith --verbose",
     "changelog:generate": "bunx --bun logsmith --output CHANGELOG.md",
-    "release": "bun --bun run changelog:generate && bunx --bun bumpx prompt --recursive",
-    "release:patch": "bun --bun run changelog:generate && bunx --bun bumpx patch --yes --recursive",
-    "release:minor": "bun --bun run changelog:generate && bunx --bun bumpx minor --yes --recursive",
-    "release:major": "bun --bun run changelog:generate && bunx --bun bumpx major --yes --recursive",
+    "release": "bunx --bun bumpx prompt --recursive",
+    "release:patch": "bunx --bun bumpx patch --yes --recursive",
+    "release:minor": "bunx --bun bumpx minor --yes --recursive",
+    "release:major": "bunx --bun bumpx major --yes --recursive",
     "postinstall": "bunx git-hooks"
   },
   "devDependencies": {
