@@ -805,8 +805,8 @@ function putBlockCoeffs(
             mask >>= 1
           }
         }
-        p = probSlice(DEFAULT_COEF_PROBS, blockType, COEF_BANDS[n], 2)
       }
+      p = probSlice(DEFAULT_COEF_PROBS, blockType, COEF_BANDS[n], 2)
     }
     // Sign bit (uniform).
     bw.writeBitUniform(sign ? 1 : 0)

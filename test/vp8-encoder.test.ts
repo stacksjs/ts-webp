@@ -80,6 +80,23 @@ describe('VP8 lossy encoder', () => {
     expect(maxAbsErrorRGB(img.data, out.data)).toBeLessThan(255)
   })
 
+  it('advances coefficient contexts across textured blocks', () => {
+    const img = makeImage(16, 16, (x, y) => [
+      x * 7,
+      y * 7,
+      (x + y) * 3,
+      255,
+    ])
+    const vp8 = encodeVP8(img, { quality: 95 })
+    const out = decodeVP8(vp8)
+
+    // This block contains coefficients in several token categories. If the
+    // encoder keeps using the previous coefficient's probability context,
+    // the decoder diverges after the first large token and corrupts pixels.
+    expect(meanAbsErrorRGB(img.data, out.data)).toBeLessThan(16)
+    expect(maxAbsErrorRGB(img.data, out.data)).toBeLessThan(70)
+  })
+
   it('handles non-16-aligned dimensions via padding', () => {
     // 25×17 forces 2×2 macroblocks with edge padding.
     const img = makeImage(25, 17, (x, y) => [(x * 10) & 0xFF, (y * 15) & 0xFF, 100, 255])
