@@ -44,6 +44,7 @@
 import type { WebpImageData } from '../types'
 import { BoolEncoder } from './bool-encoder'
 import { fdct4x4, fwht4x4 } from './fdct'
+import { idct4x4Add, iwht4x4 } from './idct'
 import { BPS } from './intra'
 import { quantizeBlock } from './quant-enc'
 import {
@@ -104,6 +105,14 @@ export function encodeVP8(image: WebpImageData, options: VP8EncodeOptions = {}):
   const U = new Uint8Array(uvSize)
   const V = new Uint8Array(uvSize)
   rgbToYuv420(data, width, height, mbW * 16, mbH * 16, Y, U, V)
+
+  // Reconstructed planes. Every macroblock predicts from the RECONSTRUCTED
+  // (dequant + inverse-transform + clamp) pixels of its already-coded top /
+  // left neighbours — exactly what the decoder sees — so encoder and decoder
+  // stay in lock-step and error does not accumulate across the MB grid.
+  const Yrec = new Uint8Array(ySize)
+  const Urec = new Uint8Array(uvSize)
+  const Vrec = new Uint8Array(uvSize)
 
   // ── 2. Quantiser tables (spec §11.4) ──
   const y1Dc = DC_QUANT[clampQi(baseQ)]
@@ -179,10 +188,12 @@ export function encodeVP8(image: WebpImageData, options: VP8EncodeOptions = {}):
     let leftNzDc = 0
     for (let mx = 0; mx < mbW; mx++) {
       // Pack the 16×16 Y / 8×8 U / 8×8 V samples into BPS-strided
-      // buffers, with a 1-pixel border for the predictor.
-      gatherY16(Y, mbW * 16, mx, my, yBlock)
-      gatherUV(U, mbW * 8, mx, my, uBlock)
-      gatherUV(V, mbW * 8, mx, my, vBlock)
+      // buffers. The MB *body* comes from the source planes, but the
+      // 1-pixel top/left predictor border comes from the RECONSTRUCTED
+      // planes (the pixels the decoder will actually predict from).
+      gatherY16(Y, Yrec, mbW * 16, mx, my, yBlock)
+      gatherUV(U, Urec, mbW * 8, mx, my, uBlock)
+      gatherUV(V, Vrec, mbW * 8, mx, my, vBlock)
 
       // DC prediction (mode 0): predict every pixel as the average of
       // the 16 row-above + 16 left-column neighbours (or the spec's
@@ -235,6 +246,17 @@ export function encodeVP8(image: WebpImageData, options: VP8EncodeOptions = {}):
         uNzs[i] = quantizeBlock(uLevels, i * 16, uQuant, i * 16, uvDc, uvAc) ? 1 : 0
         vNzs[i] = quantizeBlock(vLevels, i * 16, vQuant, i * 16, uvDc, uvAc) ? 1 : 0
       }
+
+      // ── Reconstruction (mirror the decoder) ──
+      // `quantizeBlock` already wrote the dequantised (level × Q) values
+      // back into the *Levels buffers in raster order, so they now hold
+      // exactly the coefficients the decoder will read. Inverse-transform
+      // and add the prediction to produce the reconstructed pixels, then
+      // store them so the NEXT macroblock predicts from the same data the
+      // decoder will.
+      reconstructY16(y2Levels, yLevels, yPred, Yrec, mbW * 16, mx, my)
+      reconstructChroma(uLevels, uPred, Urec, mbW * 8, mx, my)
+      reconstructChroma(vLevels, vPred, Vrec, mbW * 8, mx, my)
 
       // ── Mode info (per spec §11) ──
       // Skip flag is disabled (mb_no_skip_coef = 0), so no skip-bit.
@@ -365,28 +387,28 @@ function rgbToYuv420(
 }
 
 /**
- * Copy a 16×16 luma block from `Y` (with stride `stride`) into `dst`
- * (BPS-strided). The 1-pixel left/top border is filled with a 0x80
- * fallback for boundary blocks (matching libwebp's predictor input).
+ * Copy a 16×16 luma block into `dst` (BPS-strided). The MB *body* is read
+ * from the source plane `Y`; the 1-pixel top/left predictor border is read
+ * from the *reconstructed* plane `Yr` (matching what the decoder predicts
+ * from). Border samples outside the frame use libwebp's 0x80 fallback.
  */
-function gatherY16(Y: Uint8Array, stride: number, mx: number, my: number, dst: Uint8Array): void {
-  // Top border (-1 row).
+function gatherY16(Y: Uint8Array, Yr: Uint8Array, stride: number, mx: number, my: number, dst: Uint8Array): void {
+  // Top border (-1 row) — reconstructed neighbour above.
   for (let x = -1; x < 16; x++) {
     const sx = mx * 16 + x
     const sy = my * 16 - 1
     dst[(0) * BPS + (x + 1)] = (sx >= 0 && sy >= 0)
-      ? Y[sy * stride + sx]
+      ? Yr[sy * stride + sx]
       : 0x80
-    void 0
   }
-  // Left border (-1 column).
+  // Left border (-1 column) — reconstructed neighbour to the left.
   for (let y = 0; y < 16; y++) {
     const sx = mx * 16 - 1
     const sy = my * 16 + y
     dst[(y + 1) * BPS] = (sx >= 0)
-      ? Y[sy * stride + sx]
+      ? Yr[sy * stride + sx]
       : 0x80
-    // Body (this row).
+    // Body (this row) — source pixels.
     for (let x = 0; x < 16; x++) {
       dst[(y + 1) * BPS + (x + 1)] = Y[(my * 16 + y) * stride + (mx * 16 + x)]
     }
@@ -394,24 +416,84 @@ function gatherY16(Y: Uint8Array, stride: number, mx: number, my: number, dst: U
 }
 
 /** Same as `gatherY16` but for an 8×8 chroma block. */
-function gatherUV(C: Uint8Array, stride: number, mx: number, my: number, dst: Uint8Array): void {
+function gatherUV(C: Uint8Array, Cr: Uint8Array, stride: number, mx: number, my: number, dst: Uint8Array): void {
   for (let x = -1; x < 8; x++) {
     const sx = mx * 8 + x
     const sy = my * 8 - 1
     dst[(0) * BPS + (x + 1)] = (sx >= 0 && sy >= 0)
-      ? C[sy * stride + sx]
+      ? Cr[sy * stride + sx]
       : 0x80
-    void 0
   }
   for (let y = 0; y < 8; y++) {
     const sx = mx * 8 - 1
     const sy = my * 8 + y
     dst[(y + 1) * BPS] = (sx >= 0)
-      ? C[sy * stride + sx]
+      ? Cr[sy * stride + sx]
       : 0x80
     for (let x = 0; x < 8; x++) {
       dst[(y + 1) * BPS + (x + 1)] = C[(my * 8 + y) * stride + (mx * 8 + x)]
     }
+  }
+}
+
+/**
+ * Reconstruct a 16×16 luma macroblock exactly as the decoder will, and
+ * store the pixels into the reconstructed plane `Yr` at (mx, my).
+ *
+ * `y2Levels` holds the dequantised Y2 (WHT) coefficients in raster order;
+ * `yLevels` holds the dequantised AC coefficients for the 16 luma 4×4
+ * sub-blocks (DC at each block's index 0 is 0 — it lives in Y2). We invert
+ * the WHT to recover the 16 per-block DCs, inject each as `coeffs[0]`, then
+ * run the 4×4 IDCT onto a prediction-filled patch.
+ */
+function reconstructY16(
+  y2Levels: Int16Array,
+  yLevels: Int16Array,
+  pred: number,
+  Yr: Uint8Array,
+  stride: number,
+  mx: number,
+  my: number,
+): void {
+  // Invert the Walsh-Hadamard transform → 16 luma DCs (raster block order).
+  iwht4x4(y2Levels)
+  const patch = new Uint8Array(16 * 16)
+  patch.fill(pred)
+  for (let by = 0; by < 4; by++) {
+    for (let bx = 0; bx < 4; bx++) {
+      const bIdx = by * 4 + bx
+      const sub = yLevels.subarray(bIdx * 16, bIdx * 16 + 16)
+      sub[0] = y2Levels[bIdx]
+      idct4x4Add(sub as unknown as Int16Array, patch, 16, by * 4 * 16 + bx * 4)
+    }
+  }
+  for (let y = 0; y < 16; y++) {
+    const row = (my * 16 + y) * stride + mx * 16
+    for (let x = 0; x < 16; x++) Yr[row + x] = patch[y * 16 + x]
+  }
+}
+
+/**
+ * Reconstruct an 8×8 chroma macroblock (4 luma-style 4×4 sub-blocks, each
+ * with its own DC) into the reconstructed plane `Cr` at (mx, my).
+ */
+function reconstructChroma(
+  levels: Int16Array,
+  pred: number,
+  Cr: Uint8Array,
+  stride: number,
+  mx: number,
+  my: number,
+): void {
+  const patch = new Uint8Array(8 * 8)
+  patch.fill(pred)
+  for (let i = 0; i < 4; i++) {
+    const sub = levels.subarray(i * 16, i * 16 + 16)
+    idct4x4Add(sub as unknown as Int16Array, patch, 8, (i >> 1) * 4 * 8 + (i & 1) * 4)
+  }
+  for (let y = 0; y < 8; y++) {
+    const row = (my * 8 + y) * stride + mx * 8
+    for (let x = 0; x < 8; x++) Cr[row + x] = patch[y * 8 + x]
   }
 }
 
