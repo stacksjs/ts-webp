@@ -49,44 +49,28 @@ describe('VP8 + ALPH (lossy with alpha)', () => {
     expect(max).toBe(0)
   })
 
-  // `alpha-q80` (method=1, lossless VP8L alpha plane, predictor + cache):
-  // shape + R/G/B match dwebp bit-exact, but the alpha plane currently
-  // diverges past row 2 by a small per-pixel residual offset. The lossless
-  // bit-stream parser stays in lock-step with libwebp's `DecodeImageData`,
-  // and the predictor + filter inverse formulas have all been audited
-  // against libwebp's `dsp/lossless.c` and `dsp/filters.c`. The remaining
-  // divergence is consistent with a still-unidentified cache-update or
-  // backreference subtlety in cwebp's high-quality alpha encoding path.
-  // We assert RGB-channel exactness and bound the alpha-channel error
-  // so the gap can't widen unnoticed.
-  it('alpha-q80 decodes with bit-exact RGB and bounded alpha drift', () => {
-    const fix = readFileSync(join(import.meta.dir, 'fixtures/alpha-q80.webp'))
-    const refRaw = readFileSync(join(import.meta.dir, 'fixtures/alpha-q80-ref.pam'))
-    const ref = readPam(new Uint8Array(refRaw))
-    const out = decode(new Uint8Array(fix))
-    expect(out.width).toBe(ref.width)
-    expect(out.height).toBe(ref.height)
-    expect(out.hasAlpha).toBe(true)
-    let rgbMax = 0
-    let alphaMax = 0
-    for (let i = 0; i < out.data.length; i++) {
-      const d = Math.abs(out.data[i] - ref.data[i])
-      if ((i & 3) === 3) {
-        if (d > alphaMax) alphaMax = d
-      } else {
-        if (d > rgbMax) rgbMax = d
+  // `alpha-q80` (method=1, lossless VP8L alpha plane, predictor + cache)
+  // and `alpha-q95` (method=1 with a color-indexing transform): both were
+  // long tracked as "divergent" — the actual cause was the length prefix
+  // table in `vp8l/length.ts` using deflate's layout instead of VP8L's
+  // prefix scheme, so any LZ77 copy with length code ≥ 4 misread its
+  // extra bits and threw the whole stream out of alignment. With the
+  // table corrected both decode bit-exact against dwebp.
+  for (const name of ['alpha-q80', 'alpha-q95'] as const) {
+    it(`${name} matches dwebp bit-exact (RGBA)`, () => {
+      const fix = readFileSync(join(import.meta.dir, `fixtures/${name}.webp`))
+      const refRaw = readFileSync(join(import.meta.dir, `fixtures/${name}-ref.pam`))
+      const ref = readPam(new Uint8Array(refRaw))
+      const out = decode(new Uint8Array(fix))
+      expect(out.width).toBe(ref.width)
+      expect(out.height).toBe(ref.height)
+      expect(out.hasAlpha).toBe(true)
+      let max = 0
+      for (let i = 0; i < out.data.length; i++) {
+        const d = Math.abs(out.data[i] - ref.data[i])
+        if (d > max) max = d
       }
-    }
-    expect(rgbMax).toBe(0)
-    expect(alphaMax).toBeLessThan(255)
-  })
-
-  // `alpha-q95` (method=1, lossless VP8L with color-indexing transform):
-  // currently throws during the lossless decode because the bit-stream
-  // alignment after the color-indexing palette sub-image diverges from
-  // libwebp's reading. Tracked as a known limitation; the simpler
-  // `alpha-uncompressed` (method=0) and the `alpha-q80` predictor path
-  // already exercise the rest of the ALPH chunk machinery. Keeping the
-  // assertion as `.todo` so the suite reports it without failing.
-  it.todo('alpha-q95 (color-indexing alpha) — known divergence', () => {})
+      expect(max).toBe(0)
+    })
+  }
 })

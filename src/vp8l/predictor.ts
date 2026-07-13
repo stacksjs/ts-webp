@@ -193,10 +193,11 @@ export function inversePredictorTransform(
         const L = argb[i - 1]
         const T = argb[i - width]
         const TL = argb[i - width - 1]
-        const TR = x + 1 < width ? argb[i - width + 1] : argb[i - width]
-        // For mode 12 specifically the spec also handles right-edge
-        // pixels: when `x === width - 1`, TR = T. We already do that
-        // via the `argb[i - width]` fallback above.
+        // TR addressing wraps (spec §4.4 / libwebp `lossless.c`): at the
+        // rightmost column `i - width + 1` lands on the FIRST pixel of
+        // the CURRENT row — already decoded, and exactly what libwebp
+        // reads. Clamping to T here diverges from real cwebp streams.
+        const TR = argb[i - width + 1]
         predictor = predict(mode, L, T, TL, TR)
       }
 
@@ -268,7 +269,9 @@ export function applyPredictorTransform(
         const L = currRow[x - 1]
         const T = prevRow[x]
         const TL = prevRow[x - 1]
-        const TR = x + 1 < width ? prevRow[x + 1] : prevRow[x]
+        // Same TR wraparound as the decoder: rightmost column reads the
+        // first pixel of the current row (original value, not residual).
+        const TR = x + 1 < width ? prevRow[x + 1] : currRow[0]
         predictor = predict(GLOBAL_MODE, L, T, TL, TR)
       }
       argb[i] = subArgbBytewise(orig, predictor)
