@@ -53,8 +53,7 @@
     "release": "bunx --bun bumpx prompt --recursive",
     "release:patch": "bunx --bun bumpx patch --yes --recursive",
     "release:minor": "bunx --bun bumpx minor --yes --recursive",
-    "release:major": "bunx --bun bumpx major --yes --recursive",
-    "postinstall": "bunx git-hooks"
+    "release:major": "bunx --bun bumpx major --yes --recursive"
   },
   "devDependencies": {
     "@types/bun": "latest",
