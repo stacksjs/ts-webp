@@ -1,5 +1,20 @@
 # Changelog
 
+[Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.1...v0.1.2)
+
+## 🐛 Bug Fixes
+
+- remove consumer postinstall hook ([67d8a7d](https://github.com/stacksjs/ts-webp/commit/67d8a7d)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🧹 Chores
+
+- release v0.1.2 ([702fc93](https://github.com/stacksjs/ts-webp/commit/702fc93)) _(by Chris <chrisbreuer93@gmail.com>)_
+- **deps**: declare bun ^1.3.14 in deps.yaml ([1d88990](https://github.com/stacksjs/ts-webp/commit/1d88990)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.0...v0.1.1)
 
 ## 🚀 Features
