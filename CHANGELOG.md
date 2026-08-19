@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.2...v0.1.3)
+
+## ⚡ Performance Improvements
+
+- **build**: cut the waste out of the published output ([8011c22](https://github.com/stacksjs/ts-webp/commit/8011c22)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🧹 Chores
+
+- release v0.1.3 ([eae7fbb](https://github.com/stacksjs/ts-webp/commit/eae7fbb)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.1...v0.1.2)
 
 ## 🐛 Bug Fixes
