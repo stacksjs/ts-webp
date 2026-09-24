@@ -217,10 +217,10 @@ export function encodeVP8L(
       blueFreq[(a >>> 8) & 0xFF]++
       alphaFreq[a & 0xFF]++
     } else if (kind === TokenKind.Backref) {
-      // Backref: tokenA = lengthCode | (lengthExtraBits << 8) | (lengthExtraValue << 16)
-      //          tokenB = distanceCode | (distanceExtraBits << 8) | (distanceExtraValue << 16)
-      greenFreq[NUM_LITERAL_CODES + (a & 0xFF)]++
-      distFreq[tokenB[i] & 0xFF]++
+      // Backref: tokenA / tokenB = code | (extraBits << 6) | (extraValue << 11),
+      // for length and distance respectively. See `packPrefix`.
+      greenFreq[NUM_LITERAL_CODES + (a & 0x3F)]++
+      distFreq[tokenB[i] & 0x3F]++
     } else {
       // Cache: tokenA = cache index.
       greenFreq[GREEN_BASE + a]++
@@ -339,13 +339,13 @@ export function encodeVP8L(
       emitSymbol(writer, blueLen[b], blueCodes[b])
       emitSymbol(writer, alphaLen[al], alphaCodes[al])
     } else if (kind === TokenKind.Backref) {
-      const lengthCode = a & 0xFF
-      const lengthExtraBits = (a >>> 8) & 0xFF
-      const lengthExtraValue = (a >>> 16) & 0xFFFF
+      const lengthCode = a & 0x3F
+      const lengthExtraBits = (a >>> 6) & 0x1F
+      const lengthExtraValue = a >>> 11
       const bb = tokenB[i]
-      const distanceCode = bb & 0xFF
-      const distanceExtraBits = (bb >>> 8) & 0xFF
-      const distanceExtraValue = (bb >>> 16) & 0xFFFF
+      const distanceCode = bb & 0x3F
+      const distanceExtraBits = (bb >>> 6) & 0x1F
+      const distanceExtraValue = bb >>> 11
       const greenSym = NUM_LITERAL_CODES + lengthCode
       emitSymbol(writer, greenLen[greenSym], greenCodes[greenSym])
       if (lengthExtraBits > 0) writer.writeBits(lengthExtraValue, lengthExtraBits)
@@ -444,8 +444,8 @@ function tokenize(
           const lenEnc = lengthToCode(len)
           if (distEnc !== null && lenEnc !== null) {
             tokenKind[nTokens] = TokenKind.Backref
-            tokenA[nTokens] = lenEnc.code | (lenEnc.extraBits << 8) | (lenEnc.extraValue << 16)
-            tokenB[nTokens] = distEnc.code | (distEnc.extraBits << 8) | (distEnc.extraValue << 16)
+            tokenA[nTokens] = packPrefix(lenEnc)
+            tokenB[nTokens] = packPrefix(distEnc)
             nTokens++
             // Update cache + hash for every pixel inside the run so the
             // decoder's cache stays in sync and later matches can pick
@@ -497,6 +497,22 @@ function tokenize(
   }
 
   return nTokens
+}
+
+/**
+ * One prefix-coded value in a token word: code in bits 0-5, extra-bit count
+ * in 6-10, extra value from bit 11 up.
+ *
+ * This used to be `code | extraBits << 8 | extraValue << 16`, which leaves
+ * the value 16 bits. Distance codes 36-39 carry 17 and 18 extra bits, so a
+ * backreference reaching further back than about 262k pixels had its
+ * distance silently truncated: the bitstream stayed valid, and decoded to
+ * the wrong pixels from that point on. Small images never reach that far,
+ * which is why the round-trip tests all passed; a 560x1024 alpha mask did.
+ * 6 + 5 + 18 = 29 bits, so the widest value now fits with room to spare.
+ */
+function packPrefix(prefix: { code: number, extraBits: number, extraValue: number }): number {
+  return (prefix.code | (prefix.extraBits << 6) | (prefix.extraValue << 11)) >>> 0
 }
 
 /**
