@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.5...v0.1.6)
+
+## 🐛 Bug Fixes
+
+- **vp8**: transform chroma residuals with their own stride ([017e96f](https://github.com/stacksjs/ts-webp/commit/017e96f)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🧹 Chores
+
+- release v0.1.6 ([cf2dcb6](https://github.com/stacksjs/ts-webp/commit/cf2dcb6)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.4...v0.1.5)
 
 ## 🐛 Bug Fixes
