@@ -235,8 +235,8 @@ export function encodeVP8(image: WebpImageData, options: VP8EncodeOptions = {}):
       }
       // Quantise UV blocks.
       for (let i = 0; i < 4; i++) {
-        fdct4x4Residual(uResidual, (i >> 1) * 4, (i & 1) * 4, uLevels.subarray(i * 16, i * 16 + 16) as unknown as Int16Array)
-        fdct4x4Residual(vResidual, (i >> 1) * 4, (i & 1) * 4, vLevels.subarray(i * 16, i * 16 + 16) as unknown as Int16Array)
+        fdct4x4Residual(uResidual, (i >> 1) * 4, (i & 1) * 4, uLevels.subarray(i * 16, i * 16 + 16) as unknown as Int16Array, 8)
+        fdct4x4Residual(vResidual, (i >> 1) * 4, (i & 1) * 4, vLevels.subarray(i * 16, i * 16 + 16) as unknown as Int16Array, 8)
       }
       const uQuant = new Int16Array(4 * 16)
       const vQuant = new Int16Array(4 * 16)
@@ -572,7 +572,7 @@ function computeResidual8(block: Uint8Array, pred: number, residual: Int16Array)
  * `residual`. Wraps the int16 residual into the byte-shaped buffer the
  * `fdct4x4` function expects (it reads bytes via `BPS` stride).
  */
-function fdct4x4Residual(residual: Int16Array, subY: number, subX: number, out: Int16Array): void {
+function fdct4x4Residual(residual: Int16Array, subY: number, subX: number, out: Int16Array, stride = 16): void {
   // We can't directly hand a residual int16 to the byte-stride FDCT.
   // libwebp's FDCT wants `src - ref` where both are uint8 — so it
   // computes the residual itself. We do the same here: just copy the
@@ -584,7 +584,13 @@ function fdct4x4Residual(residual: Int16Array, subY: number, subX: number, out: 
   // back to [0, 255] for the byte-stride DCT path. Easier: do the
   // forward DCT directly on the int16 residual using libwebp's exact
   // formulas.
-  fdct4x4Int16(residual, (subY * 16 + subX), 16, out)
+  // The residual's own row width: 16 for luma, 8 for chroma. This was a
+  // hard-coded 16, so every chroma sub-block read the wrong rows and the
+  // bottom two read past the end of the 8x8 buffer as zeros: the lower half
+  // of each chroma block kept only its prediction, which showed up as
+  // horizontal colour bands and as saturated colours drifting from block to
+  // block, at every quality setting.
+  fdct4x4Int16(residual, (subY * stride + subX), stride, out)
 }
 
 /**
