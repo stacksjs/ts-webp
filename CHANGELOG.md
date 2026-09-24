@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.4...v0.1.5)
+
+## 🐛 Bug Fixes
+
+- **vp8l**: stop truncating backreference distances past 262k pixels ([981754b](https://github.com/stacksjs/ts-webp/commit/981754b)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🧹 Chores
+
+- release v0.1.5 ([ba420ff](https://github.com/stacksjs/ts-webp/commit/ba420ff)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.3...v0.1.4)
 
 ## 🐛 Bug Fixes
