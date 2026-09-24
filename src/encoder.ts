@@ -63,10 +63,11 @@ export async function encodeAsync(
  * The current implementation always uses 16×16 intra-DC prediction and
  * a single token partition — see `vp8/encoder.ts` for the scope notes.
  *
- * Alpha is silently dropped from the output (VP8 itself doesn't carry
- * alpha; the `VP8X + ALPH + VP8` extended container would be required,
- * which we don't emit on the encode side yet). Round-tripping an opaque
- * image is fine; round-tripping a transparent one will lose alpha.
+ * VP8 itself has no alpha, so a translucent image is written in the
+ * extended form, `VP8X + ALPH + VP8`: the colour stays lossy and the mask
+ * travels beside it, compressed losslessly. This used to drop alpha without
+ * a word, and since lossy is what image pipelines ask for, every
+ * transparent PNG they converted came out on a solid black box.
  */
 function encodeLossy(imageData: WebpImageData, options: WebpEncodeOptions): Uint8Array {
   // Map the public `quality: 0..100` (cwebp convention, higher = better)
@@ -77,9 +78,69 @@ function encodeLossy(imageData: WebpImageData, options: WebpEncodeOptions): Uint
   if (q100 < 0 || q100 > 100) throw new Error('ts-webp: quality must be 0..100')
   const qIndex = Math.round(127 - (q100 / 100) * 127)
   const vp8Data = encodeVP8(imageData, { quality: qIndex })
+
+  const alpha = imageData.hasAlpha === false ? null : translucentAlphaPlane(imageData)
+  if (!alpha) {
+    return createRiffContainer([
+      { fourCC: 'VP8 ', data: vp8Data },
+    ])
+  }
+
   return createRiffContainer([
+    { fourCC: 'VP8X', data: vp8xChunk(imageData.width, imageData.height, true) },
+    { fourCC: 'ALPH', data: encodeAlphaChunk(alpha, imageData.width, imageData.height, options) },
     { fourCC: 'VP8 ', data: vp8Data },
   ])
+}
+
+/** The alpha plane, one byte per pixel, or null when every pixel is opaque. */
+function translucentAlphaPlane(imageData: WebpImageData): Uint8Array | null {
+  const { data, width, height } = imageData
+  const plane = new Uint8Array(width * height)
+  let translucent = false
+  for (let i = 0; i < plane.length; i++) {
+    const a = data[i * 4 + 3]
+    plane[i] = a
+    if (a !== 255)
+      translucent = true
+  }
+  return translucent ? plane : null
+}
+
+/**
+ * An `ALPH` chunk: compression method 1, no filter, no pre-processing.
+ *
+ * Method 1 stores the plane as the GREEN channel of a VP8L image stream,
+ * and "image stream" means the bitstream WITHOUT the 5-byte VP8L header -
+ * the dimensions come from the frame (RFC 9649 section 5.2.3, libwebp's
+ * `VP8LDecodeAlphaHeader`). That header is exactly 40 bits, so the stream
+ * begins on a byte boundary and dropping five bytes is the whole job.
+ */
+function encodeAlphaChunk(plane: Uint8Array, width: number, height: number, options: WebpEncodeOptions): Uint8Array {
+  const green = new Uint8Array(width * height * 4)
+  for (let i = 0; i < plane.length; i++) {
+    green[i * 4 + 1] = plane[i]
+    green[i * 4 + 3] = 255
+  }
+  const stream = encodeVP8L({ data: green, width, height, hasAlpha: false }, options).subarray(5)
+
+  const chunk = new Uint8Array(1 + stream.length)
+  chunk[0] = 0x01 // method 1 (lossless), filter 0, pre-processing 0
+  chunk.set(stream, 1)
+  return chunk
+}
+
+/** VP8X (10 bytes): flags, 3 reserved, canvas width-1 and height-1 as 24-bit LE. */
+function vp8xChunk(width: number, height: number, alpha: boolean): Uint8Array {
+  const vp8x = new Uint8Array(10)
+  vp8x[0] = alpha ? 0x10 : 0x00
+  vp8x[4] = (width - 1) & 0xFF
+  vp8x[5] = ((width - 1) >> 8) & 0xFF
+  vp8x[6] = ((width - 1) >> 16) & 0xFF
+  vp8x[7] = (height - 1) & 0xFF
+  vp8x[8] = ((height - 1) >> 8) & 0xFF
+  vp8x[9] = ((height - 1) >> 16) & 0xFF
+  return vp8x
 }
 
 /**
@@ -131,19 +192,8 @@ export function encodeWithAlpha(
     if (data[i] < 255) { hasAlphaFlag = true; break }
   }
 
-  // VP8X chunk (10 bytes): 1 byte flags + 3 reserved + 3-byte canvas
-  // width-minus-1 + 3-byte canvas height-minus-1, all little-endian.
-  const vp8xData = new Uint8Array(10)
-  vp8xData[0] = hasAlphaFlag ? 0x10 : 0x00
-  vp8xData[4] = (width - 1) & 0xFF
-  vp8xData[5] = ((width - 1) >> 8) & 0xFF
-  vp8xData[6] = ((width - 1) >> 16) & 0xFF
-  vp8xData[7] = (height - 1) & 0xFF
-  vp8xData[8] = ((height - 1) >> 8) & 0xFF
-  vp8xData[9] = ((height - 1) >> 16) & 0xFF
-
   return createRiffContainer([
-    { fourCC: 'VP8X', data: vp8xData },
+    { fourCC: 'VP8X', data: vp8xChunk(width, height, hasAlphaFlag) },
     { fourCC: 'VP8L', data: vp8lData },
   ])
 }
