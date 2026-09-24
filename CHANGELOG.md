@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.3...v0.1.4)
+
+## 🐛 Bug Fixes
+
+- keep alpha when encoding lossy WebP ([7b0f827](https://github.com/stacksjs/ts-webp/commit/7b0f827)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🧹 Chores
+
+- release v0.1.4 ([b9e1aef](https://github.com/stacksjs/ts-webp/commit/b9e1aef)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.2...v0.1.3)
 
 ## ⚡ Performance Improvements
