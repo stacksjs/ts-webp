@@ -743,7 +743,8 @@ function yuv420ToRgba(
     if (y >= H - 2) break
     const topUVRow = y >> 1 // chroma row that "covers" luma rows y and y+1
     const curUVRow = topUVRow + 1
-    if (curUVRow >= H >> 1) break
+    // Odd heights retain a final chroma row for the last luma pair.
+    if (curUVRow >= Math.ceil(H / 2)) break
     const topYRow = y + 1
     const botYRow = y + 2
     upsampleLinePair(

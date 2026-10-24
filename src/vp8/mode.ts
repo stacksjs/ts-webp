@@ -19,7 +19,7 @@
 import type { BoolDecoder } from './bool-decoder'
 import type { VP8SegmentHeader } from './header'
 import {
-  B_DC_PRED, B_HD_PRED, B_HE_PRED, B_HU_PRED, B_LD_PRED, B_PRED, B_RD_PRED,
+  B_DC_PRED, B_HD_PRED, B_HE_PRED, B_HU_PRED, B_LD_PRED, B_RD_PRED,
   B_TM_PRED, B_VE_PRED, B_VL_PRED, B_VR_PRED, DC_PRED, H_PRED, TM_PRED, V_PRED,
 } from './tables'
 
