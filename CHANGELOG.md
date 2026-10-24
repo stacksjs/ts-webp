@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.6...v0.1.7)
+
+## 🐛 Bug Fixes
+
+- **vp8**: decode the final chroma row for odd image heights ([cb63c45](https://github.com/stacksjs/ts-webp/commit/cb63c45)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🧹 Chores
+
+- release v0.1.7 ([6c94823](https://github.com/stacksjs/ts-webp/commit/6c94823)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/stacksjs/ts-webp/compare/v0.1.5...v0.1.6)
 
 ## 🐛 Bug Fixes
